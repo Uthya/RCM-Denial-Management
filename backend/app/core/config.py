@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
     ML_MODEL_PATH: str = "app/ml/artifacts/model.json"
+    ML_ENCODERS_PATH: str = "app/ml/artifacts/feature_encoders.joblib"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
