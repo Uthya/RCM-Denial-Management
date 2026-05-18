@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.local
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML artifacts
+backend/app/ml/artifacts/*.json
+backend/app/ml/artifacts/*.bin
+
+# Logs
+*.log
+
+# Virtual environments
+venv/
+.venv/

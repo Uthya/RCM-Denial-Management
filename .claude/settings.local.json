@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(alembic revision:*)",
+      "Bash(alembic heads:*)",
+      "Bash(cmd.exe:*)",
+      "Bash(python:*)"
+    ]
+  }
+}
