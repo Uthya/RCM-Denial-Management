@@ -21,6 +21,7 @@ from app.services.parsers.base import (
     Delimiters,
     ParseContext,
     safe_date,
+    safe_date_range,
     safe_decimal,
     safe_element,
     split_composite,
@@ -235,27 +236,30 @@ def handle_dtp(
     delimiters: Delimiters,
 ) -> None:
     qualifier = safe_element(elements, 1)
-    date_value = safe_date(safe_element(elements, 3))
+    format_qual = safe_element(elements, 2)  # D8 or RD8
+    raw_date = safe_element(elements, 3)
+    from_date, to_date = safe_date_range(raw_date, format_qual)
 
-    if qualifier == "472" and date_value:
+    if qualifier == "472" and from_date:
         if ctx.last_segment_type in ("CLM", "HI") and ctx.current_claim:
             # DTP*472 after CLM or HI → claim-level service date
-            ctx.current_claim.service_from_date = date_value
-            ctx.current_claim.service_to_date = date_value
+            ctx.current_claim.service_from_date = from_date
+            ctx.current_claim.service_to_date = to_date
             logger.debug(
-                "DTP*472 → claim %s service_date=%s pos=%d",
+                "DTP*472 → claim %s service_from=%s service_to=%s pos=%d",
                 ctx.current_claim.claim_number,
-                date_value,
+                from_date,
+                to_date,
                 ctx.segment_position,
             )
         elif ctx.last_segment_type == "SV1" and ctx.claim_lines:
-            ctx.claim_lines[-1].service_date = date_value
+            ctx.claim_lines[-1].service_date = from_date
             logger.debug(
                 "DTP*472 → claim_line service_date=%s pos=%d",
-                date_value,
+                from_date,
                 ctx.segment_position,
             )
-    elif qualifier == "472" and not date_value:
+    elif qualifier == "472" and not from_date:
         claim_num = ctx.current_claim.claim_number if ctx.current_claim else "?"
         logger.warning(
             "DTP*472 at pos %d: could not parse date (claim=%s, raw=%s)",

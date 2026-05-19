@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 
 from app.models.adjustment import Adjustment
 from app.models.claim import Claim
+from app.models.claim_lifecycle import ClaimLifecycle
 from app.models.claim_line import ClaimLine
 from app.models.diagnosis import Diagnosis
 from app.models.edi_file import EdiFile
@@ -97,6 +98,28 @@ def safe_date(date_str: str) -> date | None:
         return None
 
 
+def safe_date_range(
+    date_str: str, format_qualifier: str
+) -> tuple[date | None, date | None]:
+    """Parse a DTP date value respecting the DTP02 format qualifier.
+
+    - ``"D8"``  → single CCYYMMDD → ``(date, date)``
+    - ``"RD8"`` → range ``CCYYMMDD-CCYYMMDD`` → ``(from_date, to_date)``
+    - Fallback  → treat as single date
+    """
+    date_str = date_str.strip() if date_str else ""
+    if not date_str:
+        return None, None
+
+    if format_qualifier == "RD8" and "-" in date_str:
+        parts = date_str.split("-", 1)
+        return safe_date(parts[0]), safe_date(parts[1])
+
+    # D8 or unknown qualifier — single date
+    d = safe_date(date_str)
+    return d, d
+
+
 def split_composite(element: str, separator: str) -> list[str]:
     """Split a composite element by the component separator."""
     return element.split(separator) if element else []
@@ -135,6 +158,7 @@ class ParseContext:
     adjustments: list[Adjustment] = field(default_factory=list)
     remark_codes: list[RemarkCode] = field(default_factory=list)
     raw_segments: list[RawSegment] = field(default_factory=list)
+    claim_lifecycles: list[ClaimLifecycle] = field(default_factory=list)
 
     # Diagnostics
     segment_position: int = 0
@@ -158,5 +182,9 @@ class ParseResult:
     adjustments_count: int = 0
     remark_codes_count: int = 0
     raw_segments_count: int = 0
+    claim_lifecycles_count: int = 0
     errors: list[str] = field(default_factory=list)
     success: bool = False
+    validation_errors: list = field(default_factory=list)
+    validation_warning_count: int = 0
+    validation_error_count: int = 0

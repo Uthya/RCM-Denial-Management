@@ -12,8 +12,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.claim import Claim
+from app.models.claim_lifecycle import ClaimLifecycle
 from app.models.edi_file import EdiFile
-from app.models.enums import ClaimStatus, FileType
+from app.models.enums import ClaimStatus, FileType, RelationshipType
 from app.services.parsers.base import (
     Delimiters,
     ParseContext,
@@ -23,6 +24,12 @@ from app.services.parsers.base import (
 )
 from app.services.parsers.parser_835 import parse_835
 from app.services.parsers.parser_837 import parse_837
+from app.services.validators import (
+    Severity,
+    ValidationResult,
+    validate_claims,
+    validate_remittances,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,8 @@ class EdiParser:
         file_name: str,
         raw_text: str,
         db: AsyncSession,
+        *,
+        content_hash: str | None = None,
     ) -> ParseResult:
         """Parse *raw_text* and persist all objects atomically.
 
@@ -83,6 +92,7 @@ class EdiParser:
         edi_file = EdiFile(
             file_type=file_type,
             file_name=file_name,
+            content_hash=content_hash,
             raw_text=raw_text,
             parser_version=PARSER_VERSION,
         )
@@ -97,6 +107,11 @@ class EdiParser:
             parse_837(segments, ctx, delimiters)
         else:
             parse_835(segments, ctx, delimiters)
+
+        # --- validate ---
+        validation_result = self._validate(ctx)
+        if not validation_result.valid:
+            self._filter_errors(ctx, validation_result)
 
         # --- save ---
         try:
@@ -116,7 +131,11 @@ class EdiParser:
         result.adjustments_count = len(ctx.adjustments)
         result.remark_codes_count = len(ctx.remark_codes)
         result.raw_segments_count = len(ctx.raw_segments)
-        result.errors = ctx.errors
+        result.claim_lifecycles_count = len(ctx.claim_lifecycles)
+        result.errors = ctx.errors + validation_result.error_strings()
+        result.validation_errors = validation_result.errors
+        result.validation_warning_count = validation_result.warning_count
+        result.validation_error_count = validation_result.error_count
 
         logger.info(
             "Parsed %s (%s): claims=%d lines=%d dx=%d remit=%d adj=%d "
@@ -175,6 +194,9 @@ class EdiParser:
             local_claim_map: dict[str, int] = {
                 c.claim_number: c.id for c in ctx.claims
             }
+
+            # 2b. Claim lifecycles → link resubmission/correction chains
+            await self._build_claim_lifecycles(ctx, db)
 
             # 3. ClaimLines + Diagnoses → resolve claim_id via tagged ref
             for line in ctx.claim_lines:
@@ -306,3 +328,208 @@ class EdiParser:
                     new_status.value,
                     rc.claim_status_code,
                 )
+
+    # ------------------------------------------------------------------
+    # Claim lifecycle builder
+    # ------------------------------------------------------------------
+
+    # frequency_code → RelationshipType mapping
+    _FREQ_CODE_MAP: dict[str, RelationshipType] = {
+        "6": RelationshipType.corrected,
+        "7": RelationshipType.replacement,
+        "8": RelationshipType.void,
+    }
+
+    async def _build_claim_lifecycles(
+        self,
+        ctx: ParseContext,
+        db: AsyncSession,
+    ) -> None:
+        """Create ClaimLifecycle rows for resubmission/correction chains.
+
+        Called after claims are flushed (so they have ids).  For each
+        claim with a non-original frequency_code or a
+        previous_payer_claim_control_no, find the parent claim, walk
+        existing lifecycle rows to the root, and create a new row.
+        """
+        for claim in ctx.claims:
+            prev_ctrl = claim.previous_payer_claim_control_no
+            freq = claim.frequency_code
+
+            # Skip original submissions with no back-reference
+            if not prev_ctrl and (not freq or freq == "1"):
+                continue
+
+            rel_type = self._FREQ_CODE_MAP.get(
+                freq or "", RelationshipType.resubmission
+            )
+
+            # Find parent claim by payer_claim_control_number or claim_number
+            parent_claim_id: int | None = None
+            if prev_ctrl:
+                # Check in-memory first
+                for c in ctx.claims:
+                    if c is claim:
+                        continue
+                    if c.claim_number == prev_ctrl:
+                        parent_claim_id = c.id
+                        break
+
+                # Fall back to DB
+                if parent_claim_id is None:
+                    stmt = (
+                        select(Claim.id)
+                        .where(Claim.claim_number == prev_ctrl)
+                        .limit(1)
+                    )
+                    row = (await db.execute(stmt)).scalar_one_or_none()
+                    if row is not None:
+                        parent_claim_id = row
+
+            if parent_claim_id is None:
+                logger.warning(
+                    "Lifecycle: parent claim not found for claim %s "
+                    "(prev_ctrl=%s, freq=%s); skipping",
+                    claim.claim_number,
+                    prev_ctrl,
+                    freq,
+                )
+                continue
+
+            # Walk existing lifecycles to find the original (root) claim
+            original_claim_id = parent_claim_id
+            iteration = 1
+
+            # Check if parent is itself a child in an existing lifecycle row
+            stmt = (
+                select(ClaimLifecycle)
+                .where(ClaimLifecycle.child_claim_id == parent_claim_id)
+                .limit(1)
+            )
+            existing = (await db.execute(stmt)).scalar_one_or_none()
+            if existing:
+                original_claim_id = existing.original_claim_id
+                iteration = existing.iteration_number + 1
+
+            lifecycle = ClaimLifecycle(
+                original_claim_id=original_claim_id,
+                parent_claim_id=parent_claim_id,
+                child_claim_id=claim.id,
+                relationship_type=rel_type,
+                iteration_number=iteration,
+            )
+            ctx.claim_lifecycles.append(lifecycle)
+
+        if ctx.claim_lifecycles:
+            db.add_all(ctx.claim_lifecycles)
+            await db.flush()
+            logger.info(
+                "Created %d claim lifecycle row(s)", len(ctx.claim_lifecycles)
+            )
+
+    # ------------------------------------------------------------------
+    # Post-parse validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate(ctx: ParseContext) -> ValidationResult:
+        """Run post-parse validators appropriate for the file type."""
+        if ctx.file_type == FileType.edi_837:
+            result = validate_claims(ctx)
+        else:
+            result = validate_remittances(ctx)
+
+        logger.info(
+            "Validation complete: errors=%d warnings=%d info=%d",
+            result.error_count,
+            result.warning_count,
+            result.info_count,
+        )
+        return result
+
+    @staticmethod
+    def _filter_errors(ctx: ParseContext, validation_result: ValidationResult) -> None:
+        """Remove ERROR-severity objects from context accumulators.
+
+        Cascades removals: a bad CLM removes its SV1s/HIs;
+        a bad CLP removes its CASs/LQs.
+        RawSegments are never filtered (audit trail).
+        """
+        # Collect ERROR-severity object indices by segment type
+        error_indices: dict[str, set[int]] = {}
+        for err in validation_result.errors:
+            if err.severity == Severity.ERROR:
+                error_indices.setdefault(err.segment, set()).add(err.object_index)
+
+        # --- 837 filtering ---
+        bad_claim_indices = error_indices.get("CLM", set())
+        if bad_claim_indices:
+            # Identify the actual Claim objects being removed
+            bad_claims = {
+                id(ctx.claims[i])
+                for i in bad_claim_indices
+                if i < len(ctx.claims)
+            }
+            ctx.claims = [
+                c for i, c in enumerate(ctx.claims)
+                if i not in bad_claim_indices
+            ]
+            # Cascade: remove SV1s/HIs whose _parse_claim_ref is a removed claim
+            ctx.claim_lines = [
+                cl for cl in ctx.claim_lines
+                if id(getattr(cl, "_parse_claim_ref", None)) not in bad_claims
+            ]
+            ctx.diagnoses = [
+                d for d in ctx.diagnoses
+                if id(getattr(d, "_parse_claim_ref", None)) not in bad_claims
+            ]
+
+        bad_sv1_indices = error_indices.get("SV1", set())
+        if bad_sv1_indices:
+            ctx.claim_lines = [
+                cl for i, cl in enumerate(ctx.claim_lines)
+                if i not in bad_sv1_indices
+            ]
+
+        bad_hi_indices = error_indices.get("HI", set())
+        if bad_hi_indices:
+            ctx.diagnoses = [
+                d for i, d in enumerate(ctx.diagnoses)
+                if i not in bad_hi_indices
+            ]
+
+        # --- 835 filtering ---
+        bad_clp_indices = error_indices.get("CLP", set())
+        if bad_clp_indices:
+            bad_rcs = {
+                id(ctx.remittance_claims[i])
+                for i in bad_clp_indices
+                if i < len(ctx.remittance_claims)
+            }
+            ctx.remittance_claims = [
+                rc for i, rc in enumerate(ctx.remittance_claims)
+                if i not in bad_clp_indices
+            ]
+            # Cascade: remove CASs/LQs whose _parse_rc_ref is a removed RC
+            ctx.adjustments = [
+                a for a in ctx.adjustments
+                if id(getattr(a, "_parse_rc_ref", None)) not in bad_rcs
+            ]
+            ctx.remark_codes = [
+                r for r in ctx.remark_codes
+                if id(getattr(r, "_parse_rc_ref", None)) not in bad_rcs
+            ]
+
+        bad_cas_indices = error_indices.get("CAS", set())
+        if bad_cas_indices:
+            ctx.adjustments = [
+                a for i, a in enumerate(ctx.adjustments)
+                if i not in bad_cas_indices
+            ]
+
+        bad_lq_indices = error_indices.get("LQ", set())
+        if bad_lq_indices:
+            ctx.remark_codes = [
+                r for i, r in enumerate(ctx.remark_codes)
+                if i not in bad_lq_indices
+            ]

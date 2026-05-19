@@ -1,8 +1,9 @@
-from app.models.enums import ClaimStatus, CodeType, FileType
+from app.models.enums import ClaimStatus, CodeType, FileType, RelationshipType
 from app.models.base import TimestampMixin
 from app.models.edi_file import EdiFile
 from app.models.claim import Claim
 from app.models.claim_line import ClaimLine
+from app.models.claim_lifecycle import ClaimLifecycle
 from app.models.diagnosis import Diagnosis
 from app.models.remittance_claim import RemittanceClaim
 from app.models.adjustment import Adjustment
@@ -14,10 +15,12 @@ __all__ = [
     "FileType",
     "ClaimStatus",
     "CodeType",
+    "RelationshipType",
     "TimestampMixin",
     "EdiFile",
     "Claim",
     "ClaimLine",
+    "ClaimLifecycle",
     "Diagnosis",
     "RemittanceClaim",
     "Adjustment",

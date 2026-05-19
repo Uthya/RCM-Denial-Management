@@ -19,3 +19,10 @@ class CodeType(str, enum.Enum):
     rarc = "rarc"
     pos = "pos"
     claim_status = "claim_status"
+
+
+class RelationshipType(str, enum.Enum):
+    corrected = "corrected"
+    replacement = "replacement"
+    resubmission = "resubmission"
+    void = "void"
