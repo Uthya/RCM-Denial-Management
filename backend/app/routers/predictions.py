@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -23,3 +23,12 @@ async def dataset_stats(db: AsyncSession = Depends(get_db)):
     """Return label distribution stats for the training dataset."""
     df = await build_dataset(db)
     return get_dataset_stats(df)
+
+
+@router.post("/train")
+async def train_denial_model(db: AsyncSession = Depends(get_db)):
+    from app.ml.trainer import train_model
+    try:
+        return await train_model(db)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

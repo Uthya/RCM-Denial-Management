@@ -1,8 +1,8 @@
 """add_claim_lifecycles_table
 
-Revision ID: 50f3d014f213
+Revision ID: ad40975dfb88
 Revises: f236733d715a
-Create Date: 2026-05-19 11:32:47.338928
+Create Date: 2026-05-19 12:08:50.267053
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '50f3d014f213'
+revision: str = 'ad40975dfb88'
 down_revision: Union[str, None] = 'f236733d715a'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

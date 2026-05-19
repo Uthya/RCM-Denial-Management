@@ -1,6 +1,6 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { uploadEdiFile } from '../services/api';
+import { uploadEdiFile, getDatasetStats, trainModel } from '../services/api';
 
 function UploadCard({ title, description, accent }) {
   const [file, setFile] = useState(null);
@@ -9,14 +9,20 @@ function UploadCard({ title, description, accent }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState(new Set());
   const inputRef = useRef(null);
 
   const handleFile = useCallback((f) => {
+    if (!f) return;
+    if (uploadedFiles.has(f.name)) {
+      setError(`"${f.name}" has already been uploaded.`);
+      return;
+    }
     setFile(f);
     setResult(null);
     setError(null);
     setProgress(0);
-  }, []);
+  }, [uploadedFiles]);
 
   const onDrop = useCallback(
     (e) => {
@@ -30,6 +36,7 @@ function UploadCard({ title, description, accent }) {
 
   const onUpload = async () => {
     if (!file) return;
+    const fileName = file.name;
     setLoading(true);
     setError(null);
     setResult(null);
@@ -42,6 +49,9 @@ function UploadCard({ title, description, accent }) {
       });
       setProgress(100);
       setResult(res.data);
+      setUploadedFiles((prev) => new Set(prev).add(fileName));
+      setFile(null);
+      if (inputRef.current) inputRef.current.value = '';
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Upload failed');
     } finally {
@@ -173,6 +183,133 @@ function UploadCard({ title, description, accent }) {
   );
 }
 
+function TrainModelCard() {
+  const [stats, setStats] = useState(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [training, setTraining] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const fetchStats = useCallback(async () => {
+    setStatsLoading(true);
+    try {
+      const res = await getDatasetStats();
+      setStats(res.data);
+    } catch (err) {
+      setStats(null);
+    } finally {
+      setStatsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStats();
+  }, [fetchStats]);
+
+  const onTrain = async () => {
+    setTraining(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await trainModel();
+      setResult(res.data);
+      fetchStats();
+    } catch (err) {
+      setError(err.response?.data?.detail || err.message || 'Training failed');
+    } finally {
+      setTraining(false);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-violet-200 bg-white p-5">
+      <h2 className="text-lg font-semibold text-gray-900 mb-1">Train Denial Prediction Model</h2>
+      <p className="text-sm text-gray-500 mb-4">
+        Train the XGBoost model using adjudicated claims from the database.
+      </p>
+
+      {/* Dataset stats */}
+      <div className="rounded-md bg-gray-50 border border-gray-200 p-4 mb-4">
+        <h3 className="text-sm font-medium text-gray-700 mb-2">Dataset Overview</h3>
+        {statsLoading ? (
+          <p className="text-sm text-gray-400">Loading stats...</p>
+        ) : stats ? (
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm text-gray-700">
+            <dt>Matched Claims</dt>
+            <dd className="font-semibold">{stats.total} claims</dd>
+            <dt>Denied</dt>
+            <dd className="font-mono text-red-600">{stats.denied}</dd>
+            <dt>Paid</dt>
+            <dd className="font-mono text-green-600">{stats.paid}</dd>
+            <dt>Denial Rate</dt>
+            <dd className="font-mono">{(stats.denial_rate * 100).toFixed(1)}%</dd>
+          </dl>
+        ) : (
+          <p className="text-sm text-gray-400">No labelled claims found</p>
+        )}
+      </div>
+
+      {/* Train button */}
+      <button
+        onClick={onTrain}
+        disabled={training || !stats || stats.total === 0}
+        className="w-full px-4 py-2 text-white rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-700"
+      >
+        {training ? 'Training Model...' : 'Train Model'}
+      </button>
+
+      {/* Training spinner */}
+      {training && (
+        <div className="mt-3 flex items-center gap-2 text-sm text-violet-600">
+          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          Training on {stats?.total || 0} matched claims...
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm">
+          {error}
+        </div>
+      )}
+
+      {/* Training result */}
+      {result && (
+        <div className="mt-4 p-4 rounded-md border bg-green-50 border-green-200 text-sm">
+          <h3 className="font-semibold text-gray-900 mb-2">Training Complete</h3>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-gray-700">
+            <dt>Status</dt>
+            <dd className="font-semibold text-green-700">{result.status}</dd>
+            <dt>Training Samples</dt>
+            <dd>{result.split?.train_samples}</dd>
+            <dt>Test Samples</dt>
+            <dd>{result.split?.test_samples}</dd>
+            <dt>Accuracy</dt>
+            <dd className="font-mono">{(result.metrics?.accuracy * 100).toFixed(1)}%</dd>
+            <dt>Precision</dt>
+            <dd className="font-mono">{(result.metrics?.precision * 100).toFixed(1)}%</dd>
+            <dt>Recall</dt>
+            <dd className="font-mono">{(result.metrics?.recall * 100).toFixed(1)}%</dd>
+            <dt>F1 Score</dt>
+            <dd className="font-mono">{(result.metrics?.f1 * 100).toFixed(1)}%</dd>
+            {result.metrics?.roc_auc != null && (
+              <>
+                <dt>ROC-AUC</dt>
+                <dd className="font-mono">{(result.metrics.roc_auc * 100).toFixed(1)}%</dd>
+              </>
+            )}
+            <dt>Training Time</dt>
+            <dd className="font-mono">{result.training_time_seconds}s</dd>
+          </dl>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function UploadPage() {
   return (
     <div className="max-w-4xl mx-auto">
@@ -188,6 +325,11 @@ export default function UploadPage() {
           description="Upload an 835 file to import payment data, adjustments, and remark codes."
           accent="emerald"
         />
+      </div>
+
+      <h1 className="text-2xl font-bold text-gray-900 mt-10 mb-6">Model Training</h1>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <TrainModelCard />
       </div>
     </div>
   );

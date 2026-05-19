@@ -42,4 +42,8 @@ export const getClaims = (skip = 0, limit = 100) =>
 
 export const getClaim = (id) => api.get(`/claims/${id}`);
 
+export const getDatasetStats = () => api.get('/predictions/dataset-stats');
+
+export const trainModel = () => api.post('/predictions/train');
+
 export default api;

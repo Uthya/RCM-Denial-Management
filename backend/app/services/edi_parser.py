@@ -15,6 +15,7 @@ from app.models.claim import Claim
 from app.models.claim_lifecycle import ClaimLifecycle
 from app.models.edi_file import EdiFile
 from app.models.enums import ClaimStatus, FileType, RelationshipType
+from app.models.remittance_claim import RemittanceClaim
 from app.services.parsers.base import (
     Delimiters,
     ParseContext,
@@ -108,6 +109,10 @@ class EdiParser:
         else:
             parse_835(segments, ctx, delimiters)
 
+        # --- finalize claim dates from line-level DTP ---
+        if file_type == FileType.edi_837:
+            self._finalize_claim_dates(ctx)
+
         # --- validate ---
         validation_result = self._validate(ctx)
         if not validation_result.valid:
@@ -172,6 +177,37 @@ class EdiParser:
                 if code == "835":
                     return FileType.edi_835
         return None
+
+    # ------------------------------------------------------------------
+    # Roll up line-level dates to claim
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _finalize_claim_dates(ctx: ParseContext) -> None:
+        """Roll up line-level service dates to claim level.
+
+        Sets service_from_date = MIN(line dates), service_to_date = MAX(line dates)
+        for any claim whose dates were not set by a claim-level DTP*472.
+        """
+        from collections import defaultdict
+
+        claim_line_dates: dict[int, list[date_cls]] = defaultdict(list)
+
+        for line in ctx.claim_lines:
+            ref = getattr(line, "_parse_claim_ref", None)
+            if ref is not None and line.service_date is not None:
+                claim_line_dates[id(ref)].append(line.service_date)
+
+        today = date_cls.today()
+        for claim in ctx.claims:
+            dates = claim_line_dates.get(id(claim), [])
+            if not dates:
+                continue
+            # Override placeholder or missing dates
+            if claim.service_from_date == today or claim.service_from_date is None:
+                claim.service_from_date = min(dates)
+            if claim.service_to_date is None:
+                claim.service_to_date = max(dates)
 
     # ------------------------------------------------------------------
     # Atomic save — respects FK dependencies
@@ -333,7 +369,7 @@ class EdiParser:
     # Claim lifecycle builder
     # ------------------------------------------------------------------
 
-    # frequency_code → RelationshipType mapping
+    # CLM05 frequency_code → RelationshipType mapping
     _FREQ_CODE_MAP: dict[str, RelationshipType] = {
         "6": RelationshipType.corrected,
         "7": RelationshipType.replacement,
@@ -364,10 +400,12 @@ class EdiParser:
                 freq or "", RelationshipType.resubmission
             )
 
-            # Find parent claim by payer_claim_control_number or claim_number
+            # Find parent claim by claim_number or payer_claim_control_number
+            # REF*F8 may contain either the original claim_number or the
+            # payer-assigned control number from the 835 (CLP07).
             parent_claim_id: int | None = None
             if prev_ctrl:
-                # Check in-memory first
+                # Tier 1: in-memory by claim_number
                 for c in ctx.claims:
                     if c is claim:
                         continue
@@ -375,7 +413,7 @@ class EdiParser:
                         parent_claim_id = c.id
                         break
 
-                # Fall back to DB
+                # Tier 2: DB by claim_number
                 if parent_claim_id is None:
                     stmt = (
                         select(Claim.id)
@@ -383,6 +421,27 @@ class EdiParser:
                         .limit(1)
                     )
                     row = (await db.execute(stmt)).scalar_one_or_none()
+                    logger.debug(
+                        "Lifecycle Tier 2 (claim_number=%s): result=%s",
+                        prev_ctrl, row,
+                    )
+                    if row is not None:
+                        parent_claim_id = row
+
+                # Tier 3: DB via remittance_claims.payer_claim_control_number
+                if parent_claim_id is None:
+                    stmt = (
+                        select(RemittanceClaim.claim_id)
+                        .where(
+                            RemittanceClaim.payer_claim_control_number == prev_ctrl
+                        )
+                        .limit(1)
+                    )
+                    row = (await db.execute(stmt)).scalar_one_or_none()
+                    logger.debug(
+                        "Lifecycle Tier 3 (payer_ctrl=%s): result=%s",
+                        prev_ctrl, row,
+                    )
                     if row is not None:
                         parent_claim_id = row
 

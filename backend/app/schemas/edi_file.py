@@ -24,6 +24,16 @@ class EdiFileResponse(SchemaBase):
     updated_at: datetime
 
 
+class ValidationErrorResponse(SchemaBase):
+    segment: str
+    field: str
+    message: str
+    severity: str
+    position: int = 0
+    claim_identifier: str | None = None
+    validator: str = ""
+
+
 class ParseResultResponse(SchemaBase):
     edi_file_id: int | None = None
     file_type: str = ""
@@ -36,3 +46,6 @@ class ParseResultResponse(SchemaBase):
     raw_segments_count: int = 0
     errors: list[str] = []
     success: bool = False
+    validation_errors: list[ValidationErrorResponse] = []
+    validation_warning_count: int = 0
+    validation_error_count: int = 0
