@@ -12,25 +12,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.claim import Claim
-from app.models.enums import ClaimStatus
 
-# Statuses that have a ground-truth adjudication outcome.
-_LABELED_STATUSES = {
-    ClaimStatus.paid,
-    ClaimStatus.partially_paid,
-    ClaimStatus.denied,
-}
+# CLP02 status codes from 835 remittance segments.
+_DENIED_CLP02 = {"4"}
+_PAID_CLP02 = {"1", "2", "3", "19", "20"}
 
 
-def _label_claim(status: ClaimStatus) -> int | None:
-    """Map a claim status to a binary denial label.
+def _label_from_remittances(remittance_claims: list) -> int | None:
+    """First-pass denial label derived from remittance CLP02 codes.
 
-    Returns 0 for paid/partially_paid, 1 for denied, None for excluded statuses.
+    If ANY remittance_claim has CLP02="4" the original submission was denied,
+    even if a later resubmission was paid.  Returns 1 for denied, 0 for paid,
+    None when no actionable CLP02 code is present.
     """
-    if status == ClaimStatus.denied:
-        return 1
-    if status in (ClaimStatus.paid, ClaimStatus.partially_paid):
-        return 0
+    if not remittance_claims:
+        return None
+    codes = {rc.claim_status_code for rc in remittance_claims}
+    if codes & _DENIED_CLP02:
+        return 1  # denied on first pass
+    if codes & _PAID_CLP02:
+        return 0  # paid on first pass
     return None
 
 
@@ -38,14 +39,19 @@ async def build_dataset(db: AsyncSession) -> pd.DataFrame:
     """Query the DB and return a labeled DataFrame for ML training.
 
     Only includes claims that:
-    - Have a resolved status (paid, partially_paid, denied)
+    - Are original submissions (frequency_code IS NULL or '1')
     - Have at least one remittance_claim (proof of adjudication)
+
+    Labels are derived from remittance CLP02 codes, not the mutable
+    ``claim.claim_status`` field (which gets overwritten by resubmission 835s).
 
     Returns a DataFrame with one row per claim and a ``denied`` label column.
     """
     stmt = (
         select(Claim)
-        .where(Claim.claim_status.in_(_LABELED_STATUSES))
+        .where(
+            (Claim.frequency_code.is_(None)) | (Claim.frequency_code == "1")
+        )
         .options(
             selectinload(Claim.claim_lines),
             selectinload(Claim.diagnoses),
@@ -62,7 +68,7 @@ async def build_dataset(db: AsyncSession) -> pd.DataFrame:
         if not claim.remittance_claims:
             continue
 
-        label = _label_claim(claim.claim_status)
+        label = _label_from_remittances(claim.remittance_claims)
         if label is None:
             continue
 

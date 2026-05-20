@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "RCM Denial Management System"
     DEBUG: bool = False
 
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/rcm_denials"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Uthaya%4000@localhost:5433/rcm_denials"
 
     JWT_SECRET_KEY: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     ML_MODEL_PATH: str = "app/ml/artifacts/model.json"
     ML_ENCODERS_PATH: str = "app/ml/artifacts/feature_encoders.joblib"
+    ML_METRICS_PATH: str = "app/ml/artifacts/training_metrics.json"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

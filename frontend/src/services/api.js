@@ -37,13 +37,17 @@ export const uploadEdiFile = (file, onUploadProgress) => {
 
 export const getEdiFiles = () => api.get('/edi/files');
 
-export const getClaims = (skip = 0, limit = 100) =>
-  api.get('/claims/', { params: { skip, limit } });
+export const getClaims = ({ skip = 0, limit = 100, status, sort_by, sort_dir } = {}) =>
+  api.get('/claims/', { params: { skip, limit, status, sort_by, sort_dir } });
 
 export const getClaim = (id) => api.get(`/claims/${id}`);
 
 export const getDatasetStats = () => api.get('/predictions/dataset-stats');
 
 export const trainModel = () => api.post('/predictions/train');
+
+export const predictClaim = (claimData) => api.post('/predictions/predict', claimData);
+
+export const predictFile = (ediFileId) => api.post(`/predictions/predict-file/${ediFileId}`);
 
 export default api;
