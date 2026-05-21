@@ -120,6 +120,38 @@ def _claim_to_predict_dict(claim: Claim) -> dict:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@router.post("/predict-claim/{claim_id}", response_model=PredictionResponse)
+async def predict_claim_by_id(claim_id: int, db: AsyncSession = Depends(get_db)):
+    """Run denial prediction for a single claim by its database ID."""
+    from app.ml.predictor import get_predictor
+
+    predictor = get_predictor()
+    if not predictor.is_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Model not available. Train the model first via POST /api/predictions/train.",
+        )
+
+    stmt = (
+        select(Claim)
+        .where(Claim.id == claim_id)
+        .options(selectinload(Claim.claim_lines), selectinload(Claim.diagnoses))
+    )
+    row = await db.execute(stmt)
+    claim = row.scalars().first()
+
+    if not claim:
+        raise HTTPException(status_code=404, detail=f"Claim {claim_id} not found")
+
+    try:
+        pred_input = _claim_to_predict_dict(claim)
+        result = predictor.predict(pred_input)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+    return result
+
+
 @router.post("/predict", response_model=PredictionResponse)
 async def predict_denial(request: PredictionRequest):
     from app.ml.predictor import get_predictor
@@ -234,7 +266,11 @@ async def dataset_stats(db: AsyncSession = Depends(get_db)):
 @router.post("/train")
 async def train_denial_model(db: AsyncSession = Depends(get_db)):
     from app.ml.trainer import train_model
+    from app.ml.predictor import get_predictor
     try:
-        return await train_model(db)
+        result = await train_model(db)
+        # Reload the singleton predictor so it picks up the new artifacts
+        get_predictor().load()
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { uploadEdiFile, getDatasetStats, trainModel } from '../services/api';
+import { uploadEdiFile, getDatasetStats, trainModel, predictFile } from '../services/api';
 
 function UploadCard({ title, description, accent }) {
   const [file, setFile] = useState(null);
@@ -10,6 +10,9 @@ function UploadCard({ title, description, accent }) {
   const [error, setError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState(new Set());
+  const [predResult, setPredResult] = useState(null);
+  const [predLoading, setPredLoading] = useState(false);
+  const [predError, setPredError] = useState(null);
   const inputRef = useRef(null);
 
   const handleFile = useCallback((f) => {
@@ -40,6 +43,8 @@ function UploadCard({ title, description, accent }) {
     setLoading(true);
     setError(null);
     setResult(null);
+    setPredResult(null);
+    setPredError(null);
     setProgress(0);
     try {
       const res = await uploadEdiFile(file, (e) => {
@@ -48,10 +53,29 @@ function UploadCard({ title, description, accent }) {
         }
       });
       setProgress(100);
-      setResult(res.data);
+      const data = res.data;
+      setResult(data);
       setUploadedFiles((prev) => new Set(prev).add(fileName));
       setFile(null);
       if (inputRef.current) inputRef.current.value = '';
+
+      // Auto-predict for 837 files with claims
+      if (data.file_type === 'edi_837' && data.edi_file_id && data.claims_count > 0) {
+        setPredLoading(true);
+        try {
+          const predRes = await predictFile(data.edi_file_id);
+          setPredResult(predRes.data);
+        } catch (predErr) {
+          const isModelMissing = predErr.response?.status === 503;
+          setPredError(
+            isModelMissing
+              ? 'Prediction unavailable — train the model first'
+              : predErr.response?.data?.detail || 'Prediction failed'
+          );
+        } finally {
+          setPredLoading(false);
+        }
+      }
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Upload failed');
     } finally {
@@ -169,7 +193,7 @@ function UploadCard({ title, description, accent }) {
             </div>
           )}
 
-          {result.success && (
+          {result.success && !predResult && !predLoading && (
             <Link
               to="/claims"
               className="inline-block mt-3 text-blue-600 hover:underline font-medium"
@@ -179,6 +203,105 @@ function UploadCard({ title, description, accent }) {
           )}
         </div>
       )}
+
+      {/* Prediction loading */}
+      {predLoading && (
+        <div className="mt-4 flex items-center gap-2 text-sm text-blue-600">
+          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          Running denial predictions...
+        </div>
+      )}
+
+      {/* Prediction error (non-blocking warning) */}
+      {predError && (
+        <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md text-yellow-800 text-sm">
+          {predError}
+        </div>
+      )}
+
+      {/* Prediction summary */}
+      {predResult && (() => {
+        const total = predResult.predicted_claims || 1;
+        const high = predResult.risk_summary?.HIGH || 0;
+        const med = predResult.risk_summary?.MEDIUM || 0;
+        const low = predResult.risk_summary?.LOW || 0;
+        const highPct = Math.round((high / total) * 100);
+        const medPct = Math.round((med / total) * 100);
+        const lowPct = Math.round((low / total) * 100);
+
+        // Aggregate top risk factors across all claims (count how often each appears as a "risk" direction)
+        const reasonCounts = {};
+        predResult.claims?.forEach((c) => {
+          c.top_risk_factors?.forEach((f) => {
+            if (f.direction === 'risk') {
+              reasonCounts[f.feature] = (reasonCounts[f.feature] || 0) + 1;
+            }
+          });
+        });
+        const topReasons = Object.entries(reasonCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+
+        return (
+          <div
+            className={`mt-4 p-4 rounded-md border text-sm ${
+              high > 0 ? 'bg-red-50 border-red-300' : 'bg-green-50 border-green-200'
+            }`}
+          >
+            <h3 className="font-semibold text-gray-900 mb-1">Upload Processed Successfully</h3>
+            <p className="text-gray-700">
+              <span className="font-semibold">{total}</span> claims analyzed
+            </p>
+            {high > 0 ? (
+              <p className="text-red-700 font-medium mt-1">
+                {high} high-risk claims detected
+              </p>
+            ) : (
+              <p className="text-green-700 font-medium mt-1">No high-risk claims detected</p>
+            )}
+
+            {/* Risk distribution */}
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+              <div className="rounded-md bg-red-100 border border-red-200 py-2 px-1">
+                <p className="text-lg font-bold text-red-700">{high}</p>
+                <p className="text-xs text-red-600 font-medium">HIGH ({highPct}%)</p>
+              </div>
+              <div className="rounded-md bg-yellow-100 border border-yellow-200 py-2 px-1">
+                <p className="text-lg font-bold text-yellow-700">{med}</p>
+                <p className="text-xs text-yellow-600 font-medium">MEDIUM ({medPct}%)</p>
+              </div>
+              <div className="rounded-md bg-green-100 border border-green-200 py-2 px-1">
+                <p className="text-lg font-bold text-green-700">{low}</p>
+                <p className="text-xs text-green-600 font-medium">LOW ({lowPct}%)</p>
+              </div>
+            </div>
+
+            {/* Top risk reasons */}
+            {topReasons.length > 0 && (
+              <div className="mt-3">
+                <h4 className="font-medium text-gray-700 mb-1">Top Risk Reasons</h4>
+                <ul className="list-disc list-inside text-gray-600 space-y-0.5">
+                  {topReasons.map(([reason, count]) => (
+                    <li key={reason}>
+                      {reason} <span className="text-gray-400">({count} claims)</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <Link
+              to="/claims"
+              className="inline-block mt-3 text-blue-600 hover:underline font-medium"
+            >
+              View Claims &rarr;
+            </Link>
+          </div>
+        );
+      })()}
     </div>
   );
 }

@@ -50,4 +50,7 @@ export const predictClaim = (claimData) => api.post('/predictions/predict', clai
 
 export const predictFile = (ediFileId) => api.post(`/predictions/predict-file/${ediFileId}`);
 
+export const predictClaimById = (claimId, signal) =>
+  api.post(`/predictions/predict-claim/${claimId}`, null, { signal });
+
 export default api;

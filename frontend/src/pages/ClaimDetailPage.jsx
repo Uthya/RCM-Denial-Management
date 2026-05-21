@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getClaim } from '../services/api';
+import { getClaim, predictClaimById } from '../services/api';
 
 const STATUS_STYLES = {
   paid: 'bg-green-100 text-green-800',
@@ -35,6 +35,106 @@ function Section({ title, children }) {
       <h2 className="text-lg font-semibold text-gray-900 mb-2">{title}</h2>
       {children}
     </section>
+  );
+}
+
+const RISK_STYLES = {
+  HIGH: { border: 'border-red-300', bg: 'bg-red-50', badge: 'bg-red-100 text-red-800' },
+  MEDIUM: { border: 'border-yellow-300', bg: 'bg-yellow-50', badge: 'bg-yellow-100 text-yellow-800' },
+  LOW: { border: 'border-green-300', bg: 'bg-green-50', badge: 'bg-green-100 text-green-800' },
+};
+
+function DenialRiskCard({ claimId }) {
+  const [prediction, setPrediction] = useState(null);
+  const [predLoading, setPredLoading] = useState(true);
+  const [predError, setPredError] = useState(false);
+
+  useEffect(() => {
+    if (!claimId) return;
+    const controller = new AbortController();
+    setPredLoading(true);
+    setPredError(false);
+    setPrediction(null);
+
+    predictClaimById(claimId, controller.signal)
+      .then((res) => setPrediction(res.data))
+      .catch((err) => {
+        if (err?.code === 'ERR_CANCELED') return;
+        setPredError(true);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPredLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [claimId]);
+
+  if (predLoading) {
+    return (
+      <div className="mt-4 rounded-lg border border-gray-200 p-5">
+        <div className="animate-pulse space-y-3">
+          <div className="h-4 bg-gray-200 rounded w-1/3" />
+          <div className="h-6 bg-gray-200 rounded w-1/4" />
+          <div className="h-3 bg-gray-200 rounded w-full" />
+          <div className="h-3 bg-gray-200 rounded w-5/6" />
+          <div className="h-3 bg-gray-200 rounded w-2/3" />
+        </div>
+      </div>
+    );
+  }
+
+  if (predError || !prediction) {
+    return (
+      <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-5">
+        <p className="text-sm text-gray-500">Prediction unavailable</p>
+      </div>
+    );
+  }
+
+  const style = RISK_STYLES[prediction.risk_level] || RISK_STYLES.LOW;
+  const scorePercent = Math.round(prediction.risk_score * 100);
+  const ts = new Date(prediction.prediction_timestamp).toLocaleString('en-US', {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+
+  return (
+    <div className={`mt-4 rounded-lg border ${style.border} ${style.bg} p-5`}>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-lg font-semibold text-gray-900">Denial Prediction</h2>
+        <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-bold uppercase ${style.badge}`}>
+          {prediction.risk_level}
+        </span>
+      </div>
+
+      <p className="text-3xl font-bold text-gray-900 mb-3">{scorePercent}%
+        <span className="text-sm font-normal text-gray-500 ml-2">risk score</span>
+      </p>
+
+      {prediction.top_risk_factors?.length > 0 && (
+        <div className="mb-3">
+          <h3 className="text-xs font-semibold text-gray-500 uppercase mb-1">Top Risk Factors</h3>
+          <ul className="space-y-1">
+            {prediction.top_risk_factors.slice(0, 5).map((f, i) => (
+              <li key={i} className="flex items-center justify-between text-sm">
+                <span className="text-gray-700">{f.feature}</span>
+                <span className="text-gray-500 text-xs font-mono">
+                  {f.direction === 'increases' ? '+' : '-'}{f.impact} impact
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between pt-3 border-t border-gray-200 text-xs text-gray-400">
+        <span>Predicted at: {ts}</span>
+        <span>v{prediction.model_version}</span>
+      </div>
+      <p className="mt-2 text-xs text-gray-400 italic">
+        AI prediction is advisory only and does not guarantee payer adjudication.
+      </p>
+    </div>
   );
 }
 
@@ -110,6 +210,9 @@ export default function ClaimDetailPage() {
           )}
         </dl>
       </div>
+
+      {/* Denial Prediction */}
+      <DenialRiskCard claimId={id} />
 
       {/* Service Lines */}
       {claim.claim_lines?.length > 0 && (
