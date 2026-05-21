@@ -49,11 +49,10 @@ FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "missing_diagnosis": "Missing Diagnosis",
     "missing_procedure": "Missing Procedure",
     "missing_pos": "Missing Place of Service",
-    "missing_modifier": "Missing Modifier",
 }
 
 MODEL_VERSION = "v1"
-FEATURE_VERSION = "v1"
+FEATURE_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------

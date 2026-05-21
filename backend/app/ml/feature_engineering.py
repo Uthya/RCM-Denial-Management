@@ -1,7 +1,7 @@
 """Feature engineering for claim-level denial prediction.
 
 Transforms the raw DataFrame from ``dataset.build_dataset()`` into a
-24-feature numeric matrix suitable for XGBoost training and inference.
+23-feature numeric matrix suitable for XGBoost training and inference.
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ from typing import ClassVar
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import TargetEncoder
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-FEATURE_ENGINEERING_VERSION = "v1"
+FEATURE_ENGINEERING_VERSION = "v2"
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -73,7 +73,6 @@ FEATURE_COLUMNS: list[str] = [
     "missing_diagnosis",
     "missing_procedure",
     "missing_pos",
-    "missing_modifier",
 ]
 
 
@@ -104,18 +103,17 @@ _FEATURE_METADATA: list[FeatureMeta] = [
     FeatureMeta("service_month", "int64", "service_from_date", "month 1-12"),
     FeatureMeta("service_day_of_week", "int64", "service_from_date", "0=Mon..6=Sun"),
     FeatureMeta("weekend_service", "int64", "service_from_date", "day_of_week >= 5"),
-    FeatureMeta("payer_name_encoded", "int64", "payer_name", "LabelEncoder"),
-    FeatureMeta("frequency_code_encoded", "int64", "frequency_code", "LabelEncoder"),
-    FeatureMeta("facility_type_code_encoded", "int64", "facility_type_code", "LabelEncoder"),
-    FeatureMeta("primary_procedure_code_encoded", "int64", "primary_procedure_code", "LabelEncoder"),
-    FeatureMeta("primary_diagnosis_code_encoded", "int64", "primary_diagnosis_code", "LabelEncoder"),
-    FeatureMeta("place_of_service_encoded", "int64", "place_of_service", "LabelEncoder"),
+    FeatureMeta("payer_name_encoded", "float64", "payer_name", "TargetEncoder"),
+    FeatureMeta("frequency_code_encoded", "float64", "frequency_code", "TargetEncoder"),
+    FeatureMeta("facility_type_code_encoded", "float64", "facility_type_code", "TargetEncoder"),
+    FeatureMeta("primary_procedure_code_encoded", "float64", "primary_procedure_code", "TargetEncoder"),
+    FeatureMeta("primary_diagnosis_code_encoded", "float64", "primary_diagnosis_code", "TargetEncoder"),
+    FeatureMeta("place_of_service_encoded", "float64", "place_of_service", "TargetEncoder"),
     FeatureMeta("total_billed_amount", "float64", "total_billed_amount", "passthrough"),
     FeatureMeta("missing_payer", "int64", "payer_name", "is null"),
     FeatureMeta("missing_diagnosis", "int64", "primary_diagnosis_code", "is null"),
     FeatureMeta("missing_procedure", "int64", "primary_procedure_code", "is null"),
     FeatureMeta("missing_pos", "int64", "place_of_service", "is null"),
-    FeatureMeta("missing_modifier", "int64", "has_modifier", "inverse"),
 ]
 
 
@@ -129,8 +127,8 @@ def _compute_service_duration(
 ) -> pd.Series:
     """Return integer days between service dates.
 
-    - Null dates → 0
-    - Same-day → 0
+    - Null dates -> 0
+    - Same-day -> 0
     - Negative durations clipped to 0
     """
     from_dt = pd.to_datetime(from_dates, errors="coerce")
@@ -139,30 +137,14 @@ def _compute_service_duration(
     return delta.fillna(0).clip(lower=0).astype("int64")
 
 
-def _safe_label_encode(series: pd.Series, encoder: LabelEncoder) -> pd.Series:
-    """Encode known values via a fitted LabelEncoder.
-
-    - Nulls → -1
-    - Unseen categories → -1
-    - Never raises ``ValueError``.
-    """
-    result = pd.Series(np.full(len(series), -1, dtype="int64"), index=series.index)
-    known = set(encoder.classes_)
-    mask = series.notna() & series.isin(known)
-    if mask.any():
-        result[mask] = encoder.transform(series[mask].astype(str))
-    return result
-
-
 def _validate_features(df: pd.DataFrame) -> None:
     """Assert the feature matrix is well-formed.
 
     Raises ``ValueError`` with a clear message identifying which columns fail.
     """
-    # Exactly 24 columns
-    if len(df.columns) != 24:
+    if len(df.columns) != len(FEATURE_COLUMNS):
         raise ValueError(
-            f"Expected 24 feature columns, got {len(df.columns)}: {list(df.columns)}"
+            f"Expected {len(FEATURE_COLUMNS)} feature columns, got {len(df.columns)}: {list(df.columns)}"
         )
 
     # No nulls
@@ -187,7 +169,7 @@ def _validate_features(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 class FeatureEngineer:
-    """Transforms a raw claim DataFrame into a 24-feature numeric matrix.
+    """Transforms a raw claim DataFrame into a 23-feature numeric matrix.
 
     Follows the scikit-learn fit/transform convention.
     """
@@ -202,7 +184,6 @@ class FeatureEngineer:
         "missing_diagnosis",
         "missing_procedure",
         "missing_pos",
-        "missing_modifier",
         "service_month",
         "service_day_of_week",
         "service_duration_days",
@@ -211,37 +192,18 @@ class FeatureEngineer:
     ]
 
     def __init__(self) -> None:
-        self.label_encoders_: dict[str, LabelEncoder] = {}
+        self.target_encoder_: TargetEncoder | None = None
         self.high_charge_threshold_: float | None = None
         self._is_fitted: bool = False
 
-    # ---- fit / transform / fit_transform --------------------------------
+    # ---- private helpers -------------------------------------------------
 
-    def fit(self, df: pd.DataFrame) -> FeatureEngineer:
-        """Fit encoders and thresholds from the training DataFrame."""
-        # Label encoders — fit on non-null values only
-        for col in _CATEGORICAL_COLUMNS:
-            le = LabelEncoder()
-            non_null = df[col].dropna().astype(str)
-            if len(non_null) > 0:
-                le.fit(non_null)
-            else:
-                le.classes_ = np.array([], dtype=object)
-            self.label_encoders_[col] = le
+    def _build_base_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Build all non-categorical features.
 
-        # 75th percentile threshold for high_charge_claim
-        self.high_charge_threshold_ = float(
-            df["total_charge_amount"].quantile(0.75)
-        )
-
-        self._is_fitted = True
-        return self
-
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Produce the 24-column feature matrix from a raw DataFrame."""
-        if not self._is_fitted:
-            raise RuntimeError("FeatureEngineer has not been fitted. Call fit() first.")
-
+        Shared by ``transform()`` and ``fit_transform()`` to avoid
+        code duplication.
+        """
         out = pd.DataFrame(index=df.index)
 
         # 1-4: Numeric passthrough
@@ -255,7 +217,7 @@ class FeatureEngineer:
             df["service_from_date"], df["service_to_date"]
         )
 
-        # 6: has_modifier → int
+        # 6: has_modifier -> int
         out["has_modifier"] = df["has_modifier"].astype(int)
 
         # 7: multiple_lines
@@ -275,12 +237,13 @@ class FeatureEngineer:
         out["service_day_of_week"] = from_dt.dt.dayofweek.fillna(0).astype("int64")
         out["weekend_service"] = (out["service_day_of_week"] >= 5).astype(int)
 
-        # 13-18: Categorical label encoding
-        for col in _CATEGORICAL_COLUMNS:
-            out[f"{col}_encoded"] = _safe_label_encode(
-                df[col], self.label_encoders_[col]
-            )
+        return out
 
+    def _finalize(self, out: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
+        """Add remaining features, enforce column order, coerce types, validate.
+
+        Called after categorical encoding columns have been added to ``out``.
+        """
         # 19: total_billed_amount passthrough
         out["total_billed_amount"] = df["total_billed_amount"].astype("float64")
 
@@ -288,16 +251,15 @@ class FeatureEngineer:
         for feat_name, src_col in _MISSINGNESS_SOURCES.items():
             out[feat_name] = df[src_col].isna().astype(int)
 
-        # 24: missing_modifier (inverse of has_modifier)
-        out["missing_modifier"] = (~df["has_modifier"].astype(bool)).astype(int)
-
         # Enforce column order
         out = out[FEATURE_COLUMNS]
 
-        # Coerce types: bool/int columns → int64, float columns stay float64
+        # Coerce types: bool/int columns -> int64, encoded columns -> float64
         for col in out.columns:
-            if col in self._BOOL_INT_FEATURES or col.endswith("_encoded"):
+            if col in self._BOOL_INT_FEATURES:
                 out[col] = out[col].astype("int64")
+            elif col.endswith("_encoded"):
+                out[col] = out[col].astype("float64")
             else:
                 out[col] = out[col].astype("float64")
 
@@ -307,9 +269,107 @@ class FeatureEngineer:
         logger.info("Feature matrix: %d rows x %d cols", len(out), len(out.columns))
         return out
 
+    def _prepare_categorical_input(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract categorical columns as a string DataFrame for TargetEncoder."""
+        cat_df = df[_CATEGORICAL_COLUMNS].copy()
+        for col in _CATEGORICAL_COLUMNS:
+            cat_df[col] = cat_df[col].astype(str).replace("nan", np.nan).replace("None", np.nan)
+        return cat_df
+
+    # ---- fit / transform / fit_transform --------------------------------
+
+    def fit(self, df: pd.DataFrame) -> FeatureEngineer:
+        """Fit encoders and thresholds from the training DataFrame.
+
+        Requires a ``denied`` column (the binary target) for TargetEncoder.
+        """
+        if "denied" not in df.columns:
+            raise ValueError(
+                "Training DataFrame must contain a 'denied' column "
+                "(binary target) for TargetEncoder fitting."
+            )
+
+        y = df["denied"].astype(int)
+
+        # TargetEncoder — fit on all 6 categorical columns at once
+        cat_df = self._prepare_categorical_input(df)
+        self.target_encoder_ = TargetEncoder(
+            target_type="binary",
+            smooth="auto",
+            cv=5,
+            random_state=42,
+        )
+        self.target_encoder_.fit(cat_df, y)
+
+        # 75th percentile threshold for high_charge_claim
+        self.high_charge_threshold_ = float(
+            df["total_charge_amount"].quantile(0.75)
+        )
+
+        self._is_fitted = True
+        return self
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Produce the 23-column feature matrix from a raw DataFrame."""
+        if not self._is_fitted:
+            raise RuntimeError("FeatureEngineer has not been fitted. Call fit() first.")
+
+        out = self._build_base_features(df)
+
+        # 13-18: Categorical target encoding
+        cat_df = self._prepare_categorical_input(df)
+        encoded = self.target_encoder_.transform(cat_df)
+        encoded_df = pd.DataFrame(
+            encoded,
+            columns=[f"{col}_encoded" for col in _CATEGORICAL_COLUMNS],
+            index=df.index,
+        )
+        for col in encoded_df.columns:
+            out[col] = encoded_df[col]
+
+        return self._finalize(out, df)
+
     def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fit and transform in one step."""
-        return self.fit(df).transform(df)
+        """Fit and transform in one step.
+
+        Uses TargetEncoder.fit_transform() which applies internal cross-fitting
+        (5-fold CV) so that each training sample is encoded using target
+        statistics from other folds, preventing target leakage.
+        """
+        if "denied" not in df.columns:
+            raise ValueError(
+                "Training DataFrame must contain a 'denied' column "
+                "(binary target) for TargetEncoder fitting."
+            )
+
+        y = df["denied"].astype(int)
+
+        # 75th percentile threshold for high_charge_claim
+        self.high_charge_threshold_ = float(
+            df["total_charge_amount"].quantile(0.75)
+        )
+
+        out = self._build_base_features(df)
+
+        # TargetEncoder — fit_transform uses internal CV to avoid leakage
+        cat_df = self._prepare_categorical_input(df)
+        self.target_encoder_ = TargetEncoder(
+            target_type="binary",
+            smooth="auto",
+            cv=5,
+            random_state=42,
+        )
+        encoded = self.target_encoder_.fit_transform(cat_df, y)
+        encoded_df = pd.DataFrame(
+            encoded,
+            columns=[f"{col}_encoded" for col in _CATEGORICAL_COLUMNS],
+            index=df.index,
+        )
+        for col in encoded_df.columns:
+            out[col] = encoded_df[col]
+
+        self._is_fitted = True
+        return self._finalize(out, df)
 
     # ---- persistence -----------------------------------------------------
 
@@ -323,7 +383,7 @@ class FeatureEngineer:
 
         state = {
             "version": FEATURE_ENGINEERING_VERSION,
-            "label_encoders": self.label_encoders_,
+            "target_encoder": self.target_encoder_,
             "high_charge_threshold": self.high_charge_threshold_,
             "feature_columns": FEATURE_COLUMNS,
         }
@@ -354,7 +414,7 @@ class FeatureEngineer:
             )
 
         instance = cls()
-        instance.label_encoders_ = state["label_encoders"]
+        instance.target_encoder_ = state["target_encoder"]
         instance.high_charge_threshold_ = state["high_charge_threshold"]
         instance._is_fitted = True
         return instance
@@ -363,7 +423,7 @@ class FeatureEngineer:
 
     @staticmethod
     def get_feature_metadata() -> list[FeatureMeta]:
-        """Return metadata for all 24 output features."""
+        """Return metadata for all output features."""
         return list(_FEATURE_METADATA)
 
 
