@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,9 @@ from xgboost import XGBClassifier
 from app.core.config import settings
 from app.ml.dataset import build_dataset, get_dataset_stats
 from app.ml.feature_engineering import FEATURE_COLUMNS, FeatureEngineer
+from app.models.training_metric import TrainingMetric
+
+MODEL_VERSION = "v1"
 
 logger = logging.getLogger(__name__)
 
@@ -217,14 +221,77 @@ async def train_model(db: AsyncSession) -> dict:
     Returns
     -------
     dict
-        Training results from ``_run_training``.
+        Training results from ``_run_training``, augmented with the
+        ``training_id`` of the persisted history record.
     """
     df = await build_dataset(db)
 
     if df.empty:
         raise ValueError("No labelled claims found in the database")
 
-    return _run_training(df)
+    result = _run_training(df)
+    training_id = await _persist_training_metrics(db, result)
+    result["training_id"] = training_id
+    return result
+
+
+async def _persist_training_metrics(db: AsyncSession, result: dict) -> str:
+    """Insert a row into ``model_training_metrics`` capturing this run.
+
+    Why: lets the UI surface previous runs, dataset sizes, and accuracy
+    trends without re-reading artifact files. The ``training_id`` returned
+    here is also echoed in the trainer's response so the caller can link
+    immediately to the history record.
+    """
+    stats = result.get("dataset_stats", {})
+    metrics = result.get("metrics", {})
+    split = result.get("split", {})
+
+    trained_at_raw = result.get("trained_at")
+    try:
+        trained_at = (
+            datetime.fromisoformat(trained_at_raw)
+            if trained_at_raw
+            else datetime.now(timezone.utc)
+        )
+    except ValueError:
+        trained_at = datetime.now(timezone.utc)
+
+    training_id = str(uuid.uuid4())
+
+    record = TrainingMetric(
+        training_id=training_id,
+        training_timestamp=trained_at,
+        total_claims_used=int(stats.get("total", 0)),
+        training_samples=int(split.get("train_samples", 0)),
+        test_samples=int(split.get("test_samples", 0)),
+        denied_claims=int(stats.get("denied", 0)),
+        paid_claims=int(stats.get("paid", 0)),
+        denial_rate=float(stats.get("denial_rate", 0.0) or 0.0),
+        accuracy=float(metrics.get("accuracy", 0.0) or 0.0),
+        precision=float(metrics.get("precision", 0.0) or 0.0),
+        recall=float(metrics.get("recall", 0.0) or 0.0),
+        f1_score=float(metrics.get("f1", 0.0) or 0.0),
+        roc_auc=(
+            float(metrics["roc_auc"])
+            if metrics.get("roc_auc") is not None
+            else None
+        ),
+        training_time_seconds=float(result.get("training_time_seconds", 0.0)),
+        model_version=MODEL_VERSION,
+        notes=None,
+        status=str(result.get("status", "success")),
+    )
+
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    logger.info(
+        "Persisted training metrics record id=%d training_id=%s",
+        record.id,
+        training_id,
+    )
+    return training_id
 
 
 if __name__ == "__main__":

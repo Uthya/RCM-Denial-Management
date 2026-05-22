@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,14 @@ from app.models.enums import FileType
 from app.models.raw_segment import RawSegment
 from app.models.remark_code import RemarkCode
 from app.models.remittance_claim import RemittanceClaim
+
+# Avoid a top-level import of validators.base — it would create a circular
+# import via validators/__init__.py → claim_validator → parsers.base.
+# We import ValidationError / Severity lazily inside the helper below.
+# The dataclass annotation `list[ValidationError]` on ParseContext is safe
+# because `from __future__ import annotations` makes it a forward reference.
+if False:  # type-checker hint only
+    from app.services.validators.base import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +134,54 @@ def split_composite(element: str, separator: str) -> list[str]:
     return element.split(separator) if element else []
 
 
+_PARSE_CLAIM_RE = re.compile(r"\s*\(claim=([^)]+)\)\s*$")
+
+
+def parse_exception_to_validation_error(
+    exc: Exception,
+    seg_name: str,
+    pos: int,
+    current_claim_number: str | None = None,
+):
+    """Convert a handler ``ValueError``/``IndexError`` into a structured error.
+
+    Why: parse-time errors used to be appended as opaque strings to
+    ``ctx.errors``; the UI cannot group/expand those. This produces a proper
+    ``ValidationError`` so the frontend can show them by claim.
+    """
+    # Lazy import to break circular dependency with validators package.
+    from app.services.validators.base import Severity, ValidationError
+
+    raw = str(exc).strip()
+
+    prefix = f"{seg_name} at pos {pos}: "
+    if raw.startswith(prefix):
+        raw = raw[len(prefix):]
+
+    claim_match = _PARSE_CLAIM_RE.search(raw)
+    if claim_match:
+        claim_id: str | None = claim_match.group(1).strip()
+        raw = raw[: claim_match.start()].rstrip()
+    else:
+        claim_id = current_claim_number
+
+    if raw:
+        cleaned = raw.replace("_", " ").strip()
+        message = cleaned[:1].upper() + cleaned[1:] if cleaned else "Parse error"
+    else:
+        message = "Parse error"
+
+    return ValidationError(
+        segment=seg_name or "?",
+        field="",
+        message=message,
+        severity=Severity.ERROR,
+        position=pos,
+        claim_identifier=claim_id,
+        validator="parser",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Parse context — mutable state carried through dispatch
 # ---------------------------------------------------------------------------
@@ -163,6 +220,7 @@ class ParseContext:
     # Diagnostics
     segment_position: int = 0
     errors: list[str] = field(default_factory=list)
+    parse_errors: list[ValidationError] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

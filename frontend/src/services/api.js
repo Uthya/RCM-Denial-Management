@@ -53,4 +53,9 @@ export const predictFile = (ediFileId) => api.post(`/predictions/predict-file/${
 export const predictClaimById = (claimId, signal) =>
   api.post(`/predictions/predict-claim/${claimId}`, null, { signal });
 
+export const getTrainingHistory = ({ skip = 0, limit = 20 } = {}) =>
+  api.get('/ml/training-history', { params: { skip, limit } });
+
+export const getLatestTraining = () => api.get('/ml/latest-training');
+
 export default api;

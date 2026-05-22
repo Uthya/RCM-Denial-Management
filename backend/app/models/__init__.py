@@ -10,6 +10,7 @@ from app.models.adjustment import Adjustment
 from app.models.remark_code import RemarkCode
 from app.models.raw_segment import RawSegment
 from app.models.code_master import CodeMaster
+from app.models.training_metric import TrainingMetric
 
 __all__ = [
     "FileType",
@@ -27,4 +28,5 @@ __all__ = [
     "RemarkCode",
     "RawSegment",
     "CodeMaster",
+    "TrainingMetric",
 ]

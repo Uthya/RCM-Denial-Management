@@ -9,7 +9,12 @@ from __future__ import annotations
 import logging
 
 from app.models.raw_segment import RawSegment
-from app.services.parsers.base import Delimiters, ParseContext, safe_element
+from app.services.parsers.base import (
+    Delimiters,
+    ParseContext,
+    parse_exception_to_validation_error,
+    safe_element,
+)
 from app.services.parsers.handlers import (
     handle_clm,
     handle_dtp,
@@ -86,7 +91,18 @@ def parse_837(
         except (ValueError, IndexError) as exc:
             error_msg = f"{seg_name} at pos {pos}: {exc}"
             raw.parse_error = str(exc)
-            ctx.errors.append(error_msg)
+            ctx.parse_errors.append(
+                parse_exception_to_validation_error(
+                    exc,
+                    seg_name,
+                    pos,
+                    current_claim_number=(
+                        ctx.current_claim.claim_number
+                        if ctx.current_claim
+                        else None
+                    ),
+                )
+            )
             logger.error(
                 "Parse error in 837: %s (raw=%s)", error_msg, raw_seg
             )

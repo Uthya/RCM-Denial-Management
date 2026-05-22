@@ -4,7 +4,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.routers import claims, denials, appeals, predictions, auth, edi
+from app.routers import (
+    appeals,
+    auth,
+    claims,
+    denials,
+    edi,
+    predictions,
+    training_history,
+)
 
 
 @asynccontextmanager
@@ -35,6 +43,7 @@ app.include_router(denials.router, prefix="/api/denials", tags=["Denials"])
 app.include_router(appeals.router, prefix="/api/appeals", tags=["Appeals"])
 app.include_router(predictions.router, prefix="/api/predictions", tags=["Predictions"])
 app.include_router(edi.router, prefix="/api/edi", tags=["EDI"])
+app.include_router(training_history.router, prefix="/api/ml", tags=["ML"])
 
 
 @app.get("/health")

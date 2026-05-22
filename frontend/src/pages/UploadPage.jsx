@@ -1,6 +1,271 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { uploadEdiFile, getDatasetStats, trainModel, predictFile } from '../services/api';
+import {
+  getDatasetStats,
+  getTrainingHistory,
+  predictFile,
+  trainModel,
+  uploadEdiFile,
+} from '../services/api';
+
+const SEGMENT_LABELS = {
+  CLM: 'claim header',
+  SV1: 'service-line',
+  SV2: 'institutional service-line',
+  SV3: 'dental service-line',
+  DTP: 'date / time period',
+  NM1: 'name / entity',
+  HI: 'diagnosis code',
+  REF: 'reference identifier',
+  SBR: 'subscriber',
+  HL: 'hierarchical level',
+  ISA: 'interchange envelope',
+  GS: 'functional group',
+  ST: 'transaction set',
+  CAS: 'claim adjustment',
+  AMT: 'monetary amount',
+  CLP: 'claim payment',
+  PER: 'contact information',
+  PRV: 'provider',
+  N3: 'address line',
+  N4: 'city / state / postal code',
+  LX: 'line counter',
+  LIN: 'item identification',
+};
+
+function describeIssue(ve) {
+  const segLabel = SEGMENT_LABELS[ve.segment] || ve.segment;
+  const fieldPart = ve.field ? `, field ${ve.field},` : '';
+  const msg = ve.message?.trim() || 'reported a validation issue';
+  return `The ${segLabel} segment${fieldPart} ${msg.charAt(0).toLowerCase()}${msg.slice(1)}.`;
+}
+
+// Common Claim Adjustment Reason Codes (X12 CARC). Not exhaustive.
+const CARC_DESCRIPTIONS = {
+  '1': 'Deductible amount.',
+  '2': 'Coinsurance amount.',
+  '3': 'Co-payment amount.',
+  '11': 'The diagnosis is inconsistent with the procedure.',
+  '15': 'Authorization number is missing, invalid, or does not apply.',
+  '16': 'Claim/service lacks information or has submission/billing error(s).',
+  '18': 'Exact duplicate claim/service.',
+  '22': 'Care may be covered by another payer per coordination of benefits.',
+  '23': 'Impact of prior payer(s) adjudication.',
+  '24': 'Charges are covered under a capitation agreement / managed care plan.',
+  '27': 'Expenses incurred after coverage terminated.',
+  '29': 'Time limit for filing has expired.',
+  '45': 'Charge exceeds fee schedule / maximum allowable.',
+  '50': 'Non-covered service: not deemed a medical necessity.',
+  '54': 'Multiple physicians/assistants are not covered in this case.',
+  '96': 'Non-covered charge(s).',
+  '97': 'Service is included in another service already adjudicated.',
+  '109': 'Claim/service not covered by this payer/contractor.',
+  '119': 'Benefit maximum for this period or occurrence has been reached.',
+  '125': 'Submission/billing error(s).',
+  '167': 'Diagnosis is not covered.',
+  '197': 'Precertification / authorization / notification absent.',
+  '198': 'Precertification / authorization exceeded.',
+  '204': 'Service/equipment/drug is not covered under the patient’s plan.',
+};
+
+const ADJUSTMENT_GROUP_LABELS = {
+  CO: 'Contractual Obligation',
+  PR: 'Patient Responsibility',
+  OA: 'Other Adjustment',
+  PI: 'Payer-Initiated Reduction',
+  CR: 'Correction & Reversal',
+};
+
+const SOURCE_META = {
+  parser: { label: 'Parser', cls: 'bg-red-50 text-red-700 border-red-200' },
+  payer: { label: 'Payer', cls: 'bg-amber-50 text-amber-800 border-amber-200' },
+  model: { label: 'Model', cls: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
+};
+
+function getSource(finding) {
+  return SOURCE_META[finding.source] || SOURCE_META.parser;
+}
+
+function describePayerFinding(finding) {
+  const carc = finding.meta?.reason_code;
+  const desc = carc && CARC_DESCRIPTIONS[carc];
+  if (desc) return desc;
+  const groupLabel =
+    ADJUSTMENT_GROUP_LABELS[finding.meta?.group_code] || 'adjustment';
+  return `The payer applied a ${groupLabel} adjustment (CARC ${carc || '?'}) on this claim.`;
+}
+
+function describeModelFinding(finding) {
+  const factors = (finding.meta?.factors || [])
+    .map((f) => f.feature.replace(/_/g, ' '))
+    .slice(0, 3);
+  if (factors.length === 0) {
+    return 'The denial-prediction model flagged this claim as elevated risk.';
+  }
+  return `Top contributors: ${factors.join(', ')}.`;
+}
+
+function describeFinding(finding) {
+  if (finding.source === 'payer') return describePayerFinding(finding);
+  if (finding.source === 'model') return describeModelFinding(finding);
+  return describeIssue(finding);
+}
+
+function ClaimIssueRow({ label, issues }) {
+  const [expanded, setExpanded] = useState(false);
+  const count = issues.length;
+  return (
+    <li className="rounded-md border border-red-100 bg-white overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        aria-expanded={expanded}
+        className="w-full flex items-center justify-between px-3 py-2 hover:bg-red-50 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <span
+            className={`text-gray-400 text-xs transition-transform ${
+              expanded ? 'rotate-90' : ''
+            }`}
+          >
+            &#9656;
+          </span>
+          <span className="font-mono text-sm text-red-800 font-semibold">{label}</span>
+        </span>
+        <span className="text-xs text-gray-500">
+          {count} {count === 1 ? 'issue' : 'issues'}
+        </span>
+      </button>
+      {expanded && (
+        <div className="border-t border-red-100 bg-red-50/40 px-3 py-3 space-y-2">
+          {issues.map((ve, i) => {
+            const isModel = ve.source === 'model';
+            return (
+              <div key={i} className="bg-white rounded-md border border-gray-200 px-3 py-2.5">
+                <div>
+                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
+                    Issue
+                  </p>
+                  <p className="text-sm font-semibold text-gray-900 break-words">
+                    {ve.message}
+                  </p>
+                </div>
+                <div className="mt-2">
+                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
+                    Location
+                  </p>
+                  <p className="text-sm text-gray-800 font-mono">
+                    {isModel
+                      ? 'ML prediction'
+                      : `${ve.segment} Segment${ve.field ? `, Field ${ve.field}` : ''}${
+                          ve.position ? ` (Position ${ve.position})` : ''
+                        }`}
+                  </p>
+                </div>
+                <div className="mt-2">
+                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
+                    Description
+                  </p>
+                  <p className="text-sm text-gray-700">{describeFinding(ve)}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </li>
+  );
+}
+
+function DenialReasonsList({ result, predResult }) {
+  const isClaim837 = result.file_type === 'edi_837';
+
+  const { claimGroups, fileLevelIssues } = useMemo(() => {
+    const groups = {};
+    const fileLevel = [];
+
+    if (!isClaim837) return { claimGroups: groups, fileLevelIssues: fileLevel };
+
+    // 1. Parser-layer structural findings.
+    (result.validation_errors || []).forEach((ve) => {
+      if (ve.validator === 'payer') return; // never show 835 CAS findings here
+      const finding = {
+        source: 'parser',
+        segment: ve.segment,
+        field: ve.field,
+        message: ve.message,
+        position: ve.position,
+        claim_identifier: ve.claim_identifier,
+        severity: ve.severity,
+      };
+      if (finding.claim_identifier) {
+        if (!groups[finding.claim_identifier]) groups[finding.claim_identifier] = [];
+        groups[finding.claim_identifier].push(finding);
+      } else {
+        fileLevel.push(finding);
+      }
+    });
+
+    // 2. Model-layer semantic findings — only HIGH-risk claims surface so
+    //    semantically-broken files (e.g. EH10) still produce reasons even
+    //    though the parser sees nothing wrong.
+    (predResult?.claims || []).forEach((c) => {
+      if (c.risk_level !== 'HIGH') return;
+      const finding = {
+        source: 'model',
+        segment: 'ML',
+        field: '',
+        message: `High denial risk — ${(c.risk_score * 100).toFixed(0)}%`,
+        position: 0,
+        claim_identifier: c.claim_number,
+        severity: 'WARNING',
+        meta: {
+          risk_score: c.risk_score,
+          factors: c.top_risk_factors || [],
+        },
+      };
+      if (!groups[finding.claim_identifier]) groups[finding.claim_identifier] = [];
+      groups[finding.claim_identifier].push(finding);
+    });
+
+    return { claimGroups: groups, fileLevelIssues: fileLevel };
+  }, [isClaim837, result.validation_errors, result.errors, predResult]);
+
+  if (!isClaim837) return null;
+
+  const claimIds = Object.keys(claimGroups).sort();
+  const hasStructured = claimIds.length > 0 || fileLevelIssues.length > 0;
+  const fallbackErrors = !hasStructured ? result.errors || [] : [];
+
+  if (!hasStructured && fallbackErrors.length === 0) return null;
+
+  return (
+    <div className="mt-4">
+      <h4 className="font-semibold text-red-700 mb-2">Reason for denial</h4>
+      {hasStructured ? (
+        <ul className="space-y-1.5">
+          {claimIds.map((id) => (
+            <ClaimIssueRow key={id} label={id} issues={claimGroups[id]} />
+          ))}
+          {fileLevelIssues.length > 0 && (
+            <ClaimIssueRow label="File-level issues" issues={fileLevelIssues} />
+          )}
+        </ul>
+      ) : (
+        <ul className="space-y-1.5">
+          {fallbackErrors.map((err, i) => (
+            <li
+              key={i}
+              className="rounded-md border border-red-100 bg-white px-3 py-2 text-sm text-red-800"
+            >
+              {err}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 function UploadCard({ title, description, accent }) {
   const [file, setFile] = useState(null);
@@ -182,16 +447,7 @@ function UploadCard({ title, description, accent }) {
             <dd>{result.raw_segments_count}</dd>
           </dl>
 
-          {result.errors?.length > 0 && (
-            <div className="mt-3">
-              <h4 className="font-medium text-red-700 mb-1">Errors</h4>
-              <ul className="list-disc list-inside text-red-600 text-xs space-y-0.5">
-                {result.errors.map((err, i) => (
-                  <li key={i}>{err}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+          <DenialReasonsList result={result} predResult={predResult} />
 
           {result.success && !predResult && !predLoading && (
             <Link
@@ -306,7 +562,7 @@ function UploadCard({ title, description, accent }) {
   );
 }
 
-function TrainModelCard() {
+function TrainModelCard({ onTrainingComplete }) {
   const [stats, setStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [training, setTraining] = useState(false);
@@ -337,6 +593,7 @@ function TrainModelCard() {
       const res = await trainModel();
       setResult(res.data);
       fetchStats();
+      onTrainingComplete?.();
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Training failed');
     } finally {
@@ -433,7 +690,145 @@ function TrainModelCard() {
   );
 }
 
+function TrainingHistoryCard({ refreshKey }) {
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetchHistory = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getTrainingHistory({ skip: 0, limit: 10 });
+      setItems(res.data?.items || []);
+      setTotal(res.data?.total || 0);
+    } catch (err) {
+      setError(err.response?.data?.detail || err.message || 'Failed to load history');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory, refreshKey]);
+
+  const fmtTimestamp = (iso) => {
+    if (!iso) return '—';
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+    } catch {
+      return iso;
+    }
+  };
+  const pct = (v) => (v == null ? '—' : `${(v * 100).toFixed(1)}%`);
+
+  return (
+    <div className="rounded-lg border border-indigo-200 bg-white p-5">
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-lg font-semibold text-gray-900">Training History</h2>
+        <button
+          type="button"
+          onClick={fetchHistory}
+          disabled={loading}
+          className="text-xs text-indigo-600 hover:underline disabled:opacity-50"
+        >
+          Refresh
+        </button>
+      </div>
+      <p className="text-sm text-gray-500 mb-4">
+        Performance metrics from previous training runs.
+      </p>
+
+      {error && (
+        <div className="p-3 mb-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm">
+          {error}
+        </div>
+      )}
+
+      {loading && items.length === 0 ? (
+        <p className="text-sm text-gray-400">Loading history...</p>
+      ) : items.length === 0 ? (
+        <p className="text-sm text-gray-400">No training runs recorded yet.</p>
+      ) : (
+        <>
+          <ul className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+            {items.map((run) => (
+              <li
+                key={run.training_id}
+                className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2.5"
+              >
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-semibold text-gray-900">
+                    {fmtTimestamp(run.training_timestamp)}
+                  </p>
+                  {run.model_version && (
+                    <span className="text-[11px] font-mono text-indigo-700 bg-indigo-50 border border-indigo-100 rounded px-1.5 py-0.5">
+                      {run.model_version}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {run.total_claims_used.toLocaleString()} claims ·{' '}
+                  {run.training_samples.toLocaleString()} train /{' '}
+                  {run.test_samples.toLocaleString()} test
+                </p>
+                <dl className="grid grid-cols-4 gap-x-2 gap-y-0.5 mt-2 text-xs">
+                  <div>
+                    <dt className="text-gray-500">Acc</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.accuracy)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-gray-500">F1</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.f1_score)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-gray-500">Prec</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.precision)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-gray-500">Rec</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.recall)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-gray-500">AUC</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.roc_auc)}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-gray-500">Denial</dt>
+                    <dd className="font-mono text-gray-900">{pct(run.denial_rate)}</dd>
+                  </div>
+                  <div className="col-span-2">
+                    <dt className="text-gray-500">Time</dt>
+                    <dd className="font-mono text-gray-900">
+                      {run.training_time_seconds?.toFixed(2)}s
+                    </dd>
+                  </div>
+                </dl>
+              </li>
+            ))}
+          </ul>
+          {total > items.length && (
+            <p className="text-xs text-gray-400 mt-2">
+              Showing {items.length} of {total} runs
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function UploadPage() {
+  const [trainingVersion, setTrainingVersion] = useState(0);
+
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Upload EDI Files</h1>
@@ -452,7 +847,10 @@ export default function UploadPage() {
 
       <h1 className="text-2xl font-bold text-gray-900 mt-10 mb-6">Model Training</h1>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <TrainModelCard />
+        <TrainModelCard
+          onTrainingComplete={() => setTrainingVersion((v) => v + 1)}
+        />
+        <TrainingHistoryCard refreshKey={trainingVersion} />
       </div>
     </div>
   );

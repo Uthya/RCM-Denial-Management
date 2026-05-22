@@ -117,6 +117,16 @@ class EdiParser:
         validation_result = self._validate(ctx)
         if not validation_result.valid:
             self._filter_errors(ctx, validation_result)
+        # Parse-time errors are surfaced as structured validation errors AFTER
+        # filtering so their (default) object_index=0 cannot accidentally
+        # remove unrelated objects from ctx.
+        for pe in ctx.parse_errors:
+            validation_result.add(pe)
+        # 835 CAS adjustments are *semantic* findings (payer adjudication),
+        # not structural errors. Surface them so the UI can show them under
+        # the same "Mistakes to be corrected" view with source=payer.
+        for pf in self._build_payer_findings(ctx):
+            validation_result.add(pf)
 
         # --- save ---
         try:
@@ -489,6 +499,54 @@ class EdiParser:
     # ------------------------------------------------------------------
     # Post-parse validation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_payer_findings(ctx: ParseContext) -> list:
+        """Turn 835 CAS adjustments into structured payer findings.
+
+        Each non-trivial Adjustment (group/reason/amount) becomes a
+        ``ValidationError`` with ``validator="payer"`` so the UI can display
+        it alongside parser findings under one "Mistakes to be corrected"
+        view. Patient-responsibility cost-share lines (PR group with
+        deductible/coinsurance/copay reasons) are skipped — they aren't
+        denial reasons.
+        """
+        from app.services.validators.base import Severity, ValidationError
+
+        COST_SHARE_REASONS = {"1", "2", "3"}  # deductible, coinsurance, copay
+        findings: list = []
+        for adj in ctx.adjustments:
+            group = (adj.adjustment_group_code or "").upper()
+            reason = (adj.adjustment_reason_code or "").strip()
+            if not reason:
+                continue
+            if group == "PR" and reason in COST_SHARE_REASONS:
+                continue
+
+            rc = getattr(adj, "_parse_rc_ref", None) or adj.remittance_claim
+            claim_num = None
+            if rc is not None:
+                # During parse, claim_number is stashed on the in-memory
+                # RemittanceClaim as `_parse_claim_number` (resolved to an
+                # actual Claim FK only later in _save_all).
+                claim_num = getattr(rc, "_parse_claim_number", None) or getattr(
+                    rc, "claim_number", None
+                )
+            amount = adj.adjustment_amount
+            amt_str = f"${amount:,.2f}" if amount is not None else "n/a"
+
+            findings.append(
+                ValidationError(
+                    segment="CAS",
+                    field=group,
+                    message=f"{group}-{reason} — {amt_str}",
+                    severity=Severity.WARNING,
+                    position=0,
+                    claim_identifier=claim_num,
+                    validator="payer",
+                )
+            )
+        return findings
 
     @staticmethod
     def _validate(ctx: ParseContext) -> ValidationResult:

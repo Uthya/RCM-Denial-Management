@@ -31,6 +31,7 @@ class ValidationErrorResponse(SchemaBase):
     severity: str
     position: int = 0
     claim_identifier: str | None = None
+    claim_id: int | None = None
     validator: str = ""
 
 
