@@ -10,6 +10,7 @@ from app.routers import (
     claims,
     denials,
     edi,
+    monitoring,
     predictions,
     recommendations,
     training_history,
@@ -48,6 +49,7 @@ app.include_router(training_history.router, prefix="/api/ml", tags=["ML"])
 app.include_router(
     recommendations.router, prefix="/api/recommendations", tags=["Recommendations"]
 )
+app.include_router(monitoring.router, prefix="/api/monitoring", tags=["Monitoring"])
 
 
 @app.get("/health")

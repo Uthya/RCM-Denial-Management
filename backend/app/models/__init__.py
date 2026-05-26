@@ -11,6 +11,7 @@ from app.models.remark_code import RemarkCode
 from app.models.raw_segment import RawSegment
 from app.models.code_master import CodeMaster
 from app.models.training_metric import TrainingMetric
+from app.models.prediction_log import PredictionLog
 
 __all__ = [
     "FileType",
@@ -29,4 +30,5 @@ __all__ = [
     "RawSegment",
     "CodeMaster",
     "TrainingMetric",
+    "PredictionLog",
 ]

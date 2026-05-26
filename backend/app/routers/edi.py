@@ -15,6 +15,7 @@ from app.schemas.edi_file import (
     ValidationErrorResponse,
 )
 from app.services.edi_parser import EdiParser
+from app.services.prediction_reconciler import reconcile_pending
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,12 @@ async def upload_edi_file(
 
     parser = EdiParser()
     result = await parser.parse_file(file.filename or "unknown.edi", raw_text, db, content_hash=content_hash)
+
+    # Back-fill any unresolved predictions whose claims now have remittances.
+    # 835 uploads are the trigger; 837 uploads are a no-op (no new remittances).
+    # Wrapped at the service layer so a reconcile failure cannot break upload.
+    if result.success and result.file_type == "edi_835":
+        await reconcile_pending(db)
 
     return ParseResultResponse(
         edi_file_id=result.edi_file_id,

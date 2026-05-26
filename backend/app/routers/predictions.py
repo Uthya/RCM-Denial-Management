@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.ml.dataset import build_dataset, get_dataset_stats
 from app.models.claim import Claim
+from app.services.prediction_logger import log_prediction, log_predictions_bulk
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +150,21 @@ async def predict_claim_by_id(claim_id: int, db: AsyncSession = Depends(get_db))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
+    await log_prediction(
+        db,
+        claim_id=claim.id,
+        claim_number=claim.claim_number,
+        claim_input=pred_input,
+        prediction_result=result,
+    )
+
     return result
 
 
 @router.post("/predict", response_model=PredictionResponse)
-async def predict_denial(request: PredictionRequest):
+async def predict_denial(
+    request: PredictionRequest, db: AsyncSession = Depends(get_db)
+):
     from app.ml.predictor import get_predictor
 
     predictor = get_predictor()
@@ -185,6 +196,14 @@ async def predict_denial(request: PredictionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
+    await log_prediction(
+        db,
+        claim_id=None,
+        claim_number=None,
+        claim_input=claim,
+        prediction_result=result,
+    )
+
     return result
 
 
@@ -212,6 +231,7 @@ async def predict_file(edi_file_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail=f"No claims found for edi_file_id={edi_file_id}")
 
     results = []
+    log_entries: list[dict] = []
     failed = 0
     for claim in claims:
         try:
@@ -226,9 +246,17 @@ async def predict_file(edi_file_id: int, db: AsyncSession = Depends(get_db)):
                 risk_level=pred["risk_level"],
                 top_risk_factors=pred["top_risk_factors"],
             ))
+            log_entries.append({
+                "claim_id": claim.id,
+                "claim_number": claim.claim_number,
+                "claim_input": pred_input,
+                "prediction_result": pred,
+            })
         except Exception:
             logger.exception("Prediction failed for claim %s", claim.claim_number)
             failed += 1
+
+    await log_predictions_bulk(db, log_entries)
 
     # Sort by risk score descending (highest risk first)
     results.sort(key=lambda r: r.risk_score, reverse=True)

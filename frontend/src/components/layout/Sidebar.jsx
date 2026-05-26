@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 
 const links = [
   { to: '/upload', label: 'Upload EDI' },
+  { to: '/monitoring', label: 'Monitoring' },
   { to: '/claims', label: 'Claims' },
 ];
 

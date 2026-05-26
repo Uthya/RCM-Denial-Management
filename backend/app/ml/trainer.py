@@ -29,6 +29,10 @@ from xgboost import XGBClassifier
 
 from app.core.config import settings
 from app.ml.dataset import build_dataset, get_dataset_stats
+from app.ml.distributions import (
+    build_distribution_snapshot,
+    save_distribution_snapshot,
+)
 from app.ml.feature_engineering import FEATURE_COLUMNS, FeatureEngineer
 from app.models.training_metric import TrainingMetric
 
@@ -183,6 +187,23 @@ def _run_training(df: pd.DataFrame) -> dict:
     }
     metrics_path.write_text(json.dumps(metrics_artifact, indent=2))
     logger.info("Saved training metrics to %s", metrics_path)
+
+    # Persist a lightweight training-data distribution snapshot for the
+    # drift monitor. Best-effort: a snapshot failure must not abort
+    # training (the model + encoders are already on disk by this point).
+    try:
+        training_scores = model.predict_proba(X)[:, 1]
+        snapshot = build_distribution_snapshot(
+            raw_df=df,
+            feature_df=X,
+            training_scores=training_scores,
+            trained_at=trained_at,
+            feature_version="v3",
+            model_version=MODEL_VERSION,
+        )
+        save_distribution_snapshot(snapshot, settings.ML_DISTRIBUTIONS_PATH)
+    except Exception:
+        logger.exception("Failed to write training distribution snapshot")
 
     return {
         "status": "success",

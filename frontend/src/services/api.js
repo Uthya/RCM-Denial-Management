@@ -63,4 +63,27 @@ export const getRecommendationsByFile = (ediFileId, validationErrors = []) =>
     validation_errors: validationErrors,
   });
 
+// --- Monitoring ---
+
+export const getLivePerformance = ({ days = 30, model_version } = {}) =>
+  api.get('/monitoring/live-performance', {
+    params: { days, model_version },
+  });
+
+export const getDriftReport = ({ days = 7 } = {}) =>
+  api.get('/monitoring/drift', { params: { days } });
+
+export const getPredictionLog = ({
+  limit = 50,
+  offset = 0,
+  resolved,
+  risk_level,
+} = {}) =>
+  api.get('/monitoring/prediction-log', {
+    params: { limit, offset, resolved, risk_level },
+  });
+
+export const getPredictionLogDetail = (predictionId) =>
+  api.get(`/monitoring/prediction-log/${predictionId}`);
+
 export default api;

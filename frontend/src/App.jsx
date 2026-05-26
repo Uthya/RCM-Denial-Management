@@ -3,6 +3,7 @@ import Sidebar from './components/layout/Sidebar';
 import UploadPage from './pages/UploadPage';
 import ClaimsPage from './pages/ClaimsPage';
 import ClaimDetailPage from './pages/ClaimDetailPage';
+import MonitoringPage from './pages/MonitoringPage';
 
 function App() {
   return (
@@ -12,6 +13,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/claims" replace />} />
           <Route path="/upload" element={<UploadPage />} />
+          <Route path="/monitoring" element={<MonitoringPage />} />
           <Route path="/claims" element={<ClaimsPage />} />
           <Route path="/claims/:id" element={<ClaimDetailPage />} />
         </Routes>
