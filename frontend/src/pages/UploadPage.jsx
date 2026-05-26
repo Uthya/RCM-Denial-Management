@@ -1,273 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   getDatasetStats,
+  getRecommendationsByFile,
   getTrainingHistory,
   predictFile,
   trainModel,
   uploadEdiFile,
 } from '../services/api';
 
-const SEGMENT_LABELS = {
-  CLM: 'claim header',
-  SV1: 'service-line',
-  SV2: 'institutional service-line',
-  SV3: 'dental service-line',
-  DTP: 'date / time period',
-  NM1: 'name / entity',
-  HI: 'diagnosis code',
-  REF: 'reference identifier',
-  SBR: 'subscriber',
-  HL: 'hierarchical level',
-  ISA: 'interchange envelope',
-  GS: 'functional group',
-  ST: 'transaction set',
-  CAS: 'claim adjustment',
-  AMT: 'monetary amount',
-  CLP: 'claim payment',
-  PER: 'contact information',
-  PRV: 'provider',
-  N3: 'address line',
-  N4: 'city / state / postal code',
-  LX: 'line counter',
-  LIN: 'item identification',
-};
-
-function describeIssue(ve) {
-  const segLabel = SEGMENT_LABELS[ve.segment] || ve.segment;
-  const fieldPart = ve.field ? `, field ${ve.field},` : '';
-  const msg = ve.message?.trim() || 'reported a validation issue';
-  return `The ${segLabel} segment${fieldPart} ${msg.charAt(0).toLowerCase()}${msg.slice(1)}.`;
-}
-
-// Common Claim Adjustment Reason Codes (X12 CARC). Not exhaustive.
-const CARC_DESCRIPTIONS = {
-  '1': 'Deductible amount.',
-  '2': 'Coinsurance amount.',
-  '3': 'Co-payment amount.',
-  '11': 'The diagnosis is inconsistent with the procedure.',
-  '15': 'Authorization number is missing, invalid, or does not apply.',
-  '16': 'Claim/service lacks information or has submission/billing error(s).',
-  '18': 'Exact duplicate claim/service.',
-  '22': 'Care may be covered by another payer per coordination of benefits.',
-  '23': 'Impact of prior payer(s) adjudication.',
-  '24': 'Charges are covered under a capitation agreement / managed care plan.',
-  '27': 'Expenses incurred after coverage terminated.',
-  '29': 'Time limit for filing has expired.',
-  '45': 'Charge exceeds fee schedule / maximum allowable.',
-  '50': 'Non-covered service: not deemed a medical necessity.',
-  '54': 'Multiple physicians/assistants are not covered in this case.',
-  '96': 'Non-covered charge(s).',
-  '97': 'Service is included in another service already adjudicated.',
-  '109': 'Claim/service not covered by this payer/contractor.',
-  '119': 'Benefit maximum for this period or occurrence has been reached.',
-  '125': 'Submission/billing error(s).',
-  '167': 'Diagnosis is not covered.',
-  '197': 'Precertification / authorization / notification absent.',
-  '198': 'Precertification / authorization exceeded.',
-  '204': 'Service/equipment/drug is not covered under the patient’s plan.',
-};
-
-const ADJUSTMENT_GROUP_LABELS = {
-  CO: 'Contractual Obligation',
-  PR: 'Patient Responsibility',
-  OA: 'Other Adjustment',
-  PI: 'Payer-Initiated Reduction',
-  CR: 'Correction & Reversal',
-};
-
 const SOURCE_META = {
   parser: { label: 'Parser', cls: 'bg-red-50 text-red-700 border-red-200' },
-  payer: { label: 'Payer', cls: 'bg-amber-50 text-amber-800 border-amber-200' },
-  model: { label: 'Model', cls: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
+  carc: { label: 'CARC', cls: 'bg-amber-50 text-amber-800 border-amber-200' },
+  model: { label: 'ML', cls: 'bg-indigo-50 text-indigo-700 border-indigo-200' },
 };
 
-function getSource(finding) {
-  return SOURCE_META[finding.source] || SOURCE_META.parser;
-}
+const STATUS_BADGE_STYLES = {
+  Denied: 'bg-red-100 text-red-700 border border-red-200',
+  'High Risk': 'bg-orange-100 text-orange-700 border border-orange-200',
+  Resolved: 'bg-emerald-100 text-emerald-700 border border-emerald-200',
+};
 
-function describePayerFinding(finding) {
-  const carc = finding.meta?.reason_code;
-  const desc = carc && CARC_DESCRIPTIONS[carc];
-  if (desc) return desc;
-  const groupLabel =
-    ADJUSTMENT_GROUP_LABELS[finding.meta?.group_code] || 'adjustment';
-  return `The payer applied a ${groupLabel} adjustment (CARC ${carc || '?'}) on this claim.`;
-}
-
-function describeModelFinding(finding) {
-  const factors = (finding.meta?.factors || [])
-    .map((f) => f.feature.replace(/_/g, ' '))
-    .slice(0, 3);
-  if (factors.length === 0) {
-    return 'The denial-prediction model flagged this claim as elevated risk.';
-  }
-  return `Top contributors: ${factors.join(', ')}.`;
-}
-
-function describeFinding(finding) {
-  if (finding.source === 'payer') return describePayerFinding(finding);
-  if (finding.source === 'model') return describeModelFinding(finding);
-  return describeIssue(finding);
-}
-
-function ClaimIssueRow({ label, issues }) {
-  const [expanded, setExpanded] = useState(false);
-  const count = issues.length;
-  return (
-    <li className="rounded-md border border-red-100 bg-white overflow-hidden">
-      <button
-        type="button"
-        onClick={() => setExpanded((e) => !e)}
-        aria-expanded={expanded}
-        className="w-full flex items-center justify-between px-3 py-2 hover:bg-red-50 transition-colors"
-      >
-        <span className="flex items-center gap-2">
-          <span
-            className={`text-gray-400 text-xs transition-transform ${
-              expanded ? 'rotate-90' : ''
-            }`}
-          >
-            &#9656;
-          </span>
-          <span className="font-mono text-sm text-red-800 font-semibold">{label}</span>
-        </span>
-        <span className="text-xs text-gray-500">
-          {count} {count === 1 ? 'issue' : 'issues'}
-        </span>
-      </button>
-      {expanded && (
-        <div className="border-t border-red-100 bg-red-50/40 px-3 py-3 space-y-2">
-          {issues.map((ve, i) => {
-            const isModel = ve.source === 'model';
-            return (
-              <div key={i} className="bg-white rounded-md border border-gray-200 px-3 py-2.5">
-                <div>
-                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
-                    Issue
-                  </p>
-                  <p className="text-sm font-semibold text-gray-900 break-words">
-                    {ve.message}
-                  </p>
-                </div>
-                <div className="mt-2">
-                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
-                    Location
-                  </p>
-                  <p className="text-sm text-gray-800 font-mono">
-                    {isModel
-                      ? 'ML prediction'
-                      : `${ve.segment} Segment${ve.field ? `, Field ${ve.field}` : ''}${
-                          ve.position ? ` (Position ${ve.position})` : ''
-                        }`}
-                  </p>
-                </div>
-                <div className="mt-2">
-                  <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
-                    Description
-                  </p>
-                  <p className="text-sm text-gray-700">{describeFinding(ve)}</p>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </li>
-  );
-}
-
-function DenialReasonsList({ result, predResult }) {
-  const isClaim837 = result.file_type === 'edi_837';
-
-  const { claimGroups, fileLevelIssues } = useMemo(() => {
-    const groups = {};
-    const fileLevel = [];
-
-    if (!isClaim837) return { claimGroups: groups, fileLevelIssues: fileLevel };
-
-    // 1. Parser-layer structural findings.
-    (result.validation_errors || []).forEach((ve) => {
-      if (ve.validator === 'payer') return; // never show 835 CAS findings here
-      const finding = {
-        source: 'parser',
-        segment: ve.segment,
-        field: ve.field,
-        message: ve.message,
-        position: ve.position,
-        claim_identifier: ve.claim_identifier,
-        severity: ve.severity,
-      };
-      if (finding.claim_identifier) {
-        if (!groups[finding.claim_identifier]) groups[finding.claim_identifier] = [];
-        groups[finding.claim_identifier].push(finding);
-      } else {
-        fileLevel.push(finding);
-      }
-    });
-
-    // 2. Model-layer semantic findings — only HIGH-risk claims surface so
-    //    semantically-broken files (e.g. EH10) still produce reasons even
-    //    though the parser sees nothing wrong.
-    (predResult?.claims || []).forEach((c) => {
-      if (c.risk_level !== 'HIGH') return;
-      const finding = {
-        source: 'model',
-        segment: 'ML',
-        field: '',
-        message: `High denial risk — ${(c.risk_score * 100).toFixed(0)}%`,
-        position: 0,
-        claim_identifier: c.claim_number,
-        severity: 'WARNING',
-        meta: {
-          risk_score: c.risk_score,
-          factors: c.top_risk_factors || [],
-        },
-      };
-      if (!groups[finding.claim_identifier]) groups[finding.claim_identifier] = [];
-      groups[finding.claim_identifier].push(finding);
-    });
-
-    return { claimGroups: groups, fileLevelIssues: fileLevel };
-  }, [isClaim837, result.validation_errors, result.errors, predResult]);
-
-  if (!isClaim837) return null;
-
-  const claimIds = Object.keys(claimGroups).sort();
-  const hasStructured = claimIds.length > 0 || fileLevelIssues.length > 0;
-  const fallbackErrors = !hasStructured ? result.errors || [] : [];
-
-  if (!hasStructured && fallbackErrors.length === 0) return null;
-
-  return (
-    <div className="mt-4">
-      <h4 className="font-semibold text-red-700 mb-2">Reason for denial</h4>
-      {hasStructured ? (
-        <ul className="space-y-1.5">
-          {claimIds.map((id) => (
-            <ClaimIssueRow key={id} label={id} issues={claimGroups[id]} />
-          ))}
-          {fileLevelIssues.length > 0 && (
-            <ClaimIssueRow label="File-level issues" issues={fileLevelIssues} />
-          )}
-        </ul>
-      ) : (
-        <ul className="space-y-1.5">
-          {fallbackErrors.map((err, i) => (
-            <li
-              key={i}
-              className="rounded-md border border-red-100 bg-white px-3 py-2 text-sm text-red-800"
-            >
-              {err}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-function UploadCard({ title, description, accent }) {
+function UploadCard({ title, description, accent, onUploadComplete }) {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -324,7 +78,7 @@ function UploadCard({ title, description, accent }) {
       setFile(null);
       if (inputRef.current) inputRef.current.value = '';
 
-      // Auto-predict for 837 files with claims
+      // Auto-predict for 837 files (file-level summary card)
       if (data.file_type === 'edi_837' && data.edi_file_id && data.claims_count > 0) {
         setPredLoading(true);
         try {
@@ -340,6 +94,16 @@ function UploadCard({ title, description, accent }) {
         } finally {
           setPredLoading(false);
         }
+      }
+
+      // Bubble up to UploadPage so the Recommendations panel can refresh.
+      // Send for both 837 and 835 — the panel decides what to show.
+      if (data.edi_file_id) {
+        onUploadComplete?.({
+          edi_file_id: data.edi_file_id,
+          file_type: data.file_type,
+          validation_errors: data.validation_errors || [],
+        });
       }
     } catch (err) {
       setError(err.response?.data?.detail || err.message || 'Upload failed');
@@ -447,8 +211,6 @@ function UploadCard({ title, description, accent }) {
             <dd>{result.raw_segments_count}</dd>
           </dl>
 
-          <DenialReasonsList result={result} predResult={predResult} />
-
           {result.success && !predResult && !predLoading && (
             <Link
               to="/claims"
@@ -488,19 +250,6 @@ function UploadCard({ title, description, accent }) {
         const medPct = Math.round((med / total) * 100);
         const lowPct = Math.round((low / total) * 100);
 
-        // Aggregate top risk factors across all claims (count how often each appears as a "risk" direction)
-        const reasonCounts = {};
-        predResult.claims?.forEach((c) => {
-          c.top_risk_factors?.forEach((f) => {
-            if (f.direction === 'risk') {
-              reasonCounts[f.feature] = (reasonCounts[f.feature] || 0) + 1;
-            }
-          });
-        });
-        const topReasons = Object.entries(reasonCounts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5);
-
         return (
           <div
             className={`mt-4 p-4 rounded-md border text-sm ${
@@ -513,7 +262,7 @@ function UploadCard({ title, description, accent }) {
             </p>
             {high > 0 ? (
               <p className="text-red-700 font-medium mt-1">
-                {high} high-risk claims detected
+                {high} high-risk claims detected — see Recommended Fixes below
               </p>
             ) : (
               <p className="text-green-700 font-medium mt-1">No high-risk claims detected</p>
@@ -535,20 +284,6 @@ function UploadCard({ title, description, accent }) {
               </div>
             </div>
 
-            {/* Top risk reasons */}
-            {topReasons.length > 0 && (
-              <div className="mt-3">
-                <h4 className="font-medium text-gray-700 mb-1">Top Risk Reasons</h4>
-                <ul className="list-disc list-inside text-gray-600 space-y-0.5">
-                  {topReasons.map(([reason, count]) => (
-                    <li key={reason}>
-                      {reason} <span className="text-gray-400">({count} claims)</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
             <Link
               to="/claims"
               className="inline-block mt-3 text-blue-600 hover:underline font-medium"
@@ -558,6 +293,180 @@ function UploadCard({ title, description, accent }) {
           </div>
         );
       })()}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// NEW: Recommended Fixes panel (left side of Row 2)
+// Single-expand accordion: only one claim can be open at a time.
+// ---------------------------------------------------------------------------
+
+function RecommendedFixesPanel({ data, loading, error, title, subtitle, emptyText }) {
+  const [openClaimId, setOpenClaimId] = useState(null);
+
+  // When the dataset is replaced (new upload), collapse any open card.
+  useEffect(() => {
+    setOpenClaimId(null);
+  }, [data?.edi_file_id]);
+
+  const claims = data?.claims || [];
+
+  return (
+    <div className="rounded-lg border border-rose-200 bg-white p-5 flex flex-col">
+      <h2 className="text-lg font-semibold text-gray-900 mb-1">
+        {title || 'Recommended Fixes for High-Risk / Denied Claims'}
+      </h2>
+      <p className="text-sm text-gray-500 mb-4">
+        {subtitle ||
+          'Per-claim corrective actions derived from parser findings, payer CARC codes, and ML risk factors.'}
+      </p>
+
+      {loading && (
+        <div className="flex items-center gap-2 text-sm text-rose-600">
+          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          Generating recommendations…
+        </div>
+      )}
+
+      {error && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && !data && (
+        <div className="text-sm text-gray-400 border border-dashed border-gray-200 rounded-md p-6 text-center">
+          {emptyText ||
+            'Recommendations will appear here after the next 837 or 835 upload.'}
+        </div>
+      )}
+
+      {!loading && !error && data && claims.length === 0 && (
+        <div className="text-sm text-gray-500 border border-dashed border-gray-200 rounded-md p-6 text-center">
+          No flagged claims in this upload. All claims look healthy.
+        </div>
+      )}
+
+      {!loading && !error && claims.length > 0 && (
+        <>
+          <div className="text-xs text-gray-500 mb-2">
+            {data.flagged_claims} of {data.total_claims_in_file} claims need attention &middot; file #{data.edi_file_id}
+          </div>
+          <ul className="space-y-1.5 max-h-[480px] overflow-y-auto pr-1">
+            {claims.map((c) => {
+              const isResolved = c.resolved || c.status_badge === 'Resolved';
+              const isOpen = !isResolved && openClaimId === c.claim_id;
+              const badgeCls = STATUS_BADGE_STYLES[c.status_badge] || 'bg-gray-100 text-gray-700 border';
+              return (
+                <li
+                  key={c.claim_id}
+                  className={`rounded-md border overflow-hidden ${
+                    isResolved
+                      ? 'border-emerald-200 bg-emerald-50/40'
+                      : 'border-gray-200 bg-white'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => !isResolved && setOpenClaimId(isOpen ? null : c.claim_id)}
+                    aria-expanded={isOpen}
+                    disabled={isResolved}
+                    className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 transition-colors ${
+                      isResolved ? 'cursor-default' : 'hover:bg-gray-50'
+                    }`}
+                  >
+                    <span className="flex items-center gap-2 min-w-0">
+                      {isResolved ? (
+                        <span className="text-emerald-600 text-sm leading-none" aria-hidden="true">
+                          &#10003;
+                        </span>
+                      ) : (
+                        <span
+                          className={`text-gray-400 text-xs transition-transform ${
+                            isOpen ? 'rotate-90' : ''
+                          }`}
+                        >
+                          &#9656;
+                        </span>
+                      )}
+                      <span className="font-mono text-sm text-gray-900 font-semibold truncate">
+                        {c.claim_number}
+                      </span>
+                      {c.payer_name && (
+                        <span className="text-xs text-gray-400 truncate hidden sm:inline">
+                          &middot; {c.payer_name}
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex items-center gap-2 flex-shrink-0">
+                      {isResolved ? (
+                        <span className="text-[11px] text-emerald-700 italic">
+                          Fix verified
+                        </span>
+                      ) : (
+                        c.risk_score != null && (
+                          <span className="text-[11px] font-mono text-gray-500">
+                            {(c.risk_score * 100).toFixed(0)}%
+                          </span>
+                        )
+                      )}
+                      <span
+                        className={`text-[11px] font-semibold rounded px-2 py-0.5 ${badgeCls}`}
+                      >
+                        {c.status_badge}
+                      </span>
+                    </span>
+                  </button>
+                  {isOpen && (
+                    <div className="border-t border-gray-100 bg-gray-50/60 px-3 py-3 space-y-2">
+                      {c.recommendations.map((rec, i) => {
+                        const sm = SOURCE_META[rec.source] || SOURCE_META.parser;
+                        return (
+                          <div
+                            key={i}
+                            className="bg-white rounded-md border border-gray-200 px-3 py-2.5"
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-1.5">
+                              <span
+                                className={`text-[10px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 border ${sm.cls}`}
+                              >
+                                {sm.label}
+                              </span>
+                              {rec.location && (
+                                <span className="text-[10px] text-gray-400 font-mono truncate">
+                                  {rec.location}
+                                </span>
+                              )}
+                            </div>
+                            <div>
+                              <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
+                                Reason for Denial
+                              </p>
+                              <p className="text-sm text-gray-900 break-words">
+                                {rec.reason}
+                              </p>
+                            </div>
+                            <div className="mt-1.5">
+                              <p className="text-[11px] uppercase tracking-wide text-gray-500 font-medium">
+                                Recommended Fix
+                              </p>
+                              <p className="text-sm text-gray-700">{rec.fix}</p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
     </div>
   );
 }
@@ -826,24 +735,109 @@ function TrainingHistoryCard({ refreshKey }) {
   );
 }
 
+async function fetchRecAndSet(setter, ediFileId, validationErrors) {
+  setter((prev) => ({ data: prev.data, loading: true, error: null }));
+  try {
+    const res = await getRecommendationsByFile(ediFileId, validationErrors);
+    setter({ data: res.data, loading: false, error: null });
+  } catch (err) {
+    const status = err.response?.status;
+    setter({
+      data: null,
+      loading: false,
+      error:
+        status === 503
+          ? 'Predictions unavailable — train the model first to surface ML-based fixes.'
+          : err.response?.data?.detail || err.message || 'Failed to load recommendations',
+    });
+  }
+}
+
 export default function UploadPage() {
   const [trainingVersion, setTrainingVersion] = useState(0);
+  // Per-file-type recommendation state so an 837 upload and an 835 upload can
+  // coexist side by side instead of overwriting each other.
+  const [rec837, setRec837] = useState({ data: null, loading: false, error: null });
+  const [rec835, setRec835] = useState({ data: null, loading: false, error: null });
+
+  // Refs so the upload handler can refresh the *other* panel without
+  // re-creating the callback on every state change.
+  const rec837Ref = useRef(rec837);
+  const rec835Ref = useRef(rec835);
+  useEffect(() => { rec837Ref.current = rec837; }, [rec837]);
+  useEffect(() => { rec835Ref.current = rec835; }, [rec835]);
+
+  const handleUploadComplete = useCallback(
+    async ({ edi_file_id, file_type, validation_errors }) => {
+      const isReplacement = file_type === 'edi_835';
+      const primarySetter = isReplacement ? setRec835 : setRec837;
+      const otherSetter = isReplacement ? setRec837 : setRec835;
+      const otherCurrent = isReplacement ? rec837Ref.current : rec835Ref.current;
+
+      // Update the panel matching the just-uploaded file type
+      const primaryFetch = fetchRecAndSet(primarySetter, edi_file_id, validation_errors);
+
+      // Re-evaluate the other panel against its last-known file id so any
+      // claims that just became "Resolved" reflect immediately.
+      const otherFetch = otherCurrent.data?.edi_file_id
+        ? fetchRecAndSet(otherSetter, otherCurrent.data.edi_file_id, [])
+        : Promise.resolve();
+
+      await Promise.all([primaryFetch, otherFetch]);
+    },
+    []
+  );
+
+  // Row 2 visibility: appear only when there's an actionable fix to show
+  // (any unresolved claim in either panel), or while a fetch is in flight,
+  // or when an error needs to be surfaced. A panel populated entirely with
+  // "Resolved" claims is *not* actionable, so the row hides in that case.
+  const has837Fix = (rec837.data?.claims || []).some((c) => !c.resolved);
+  const has835Fix = (rec835.data?.claims || []).some((c) => !c.resolved);
+  const showRecommendationRow =
+    rec837.loading || rec835.loading ||
+    rec837.error || rec835.error ||
+    has837Fix || has835Fix;
 
   return (
-    <div className="max-w-4xl mx-auto">
+    <div className="max-w-6xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Upload EDI Files</h1>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <UploadCard
           title="837 — Claim Submission"
           description="Upload an 837 file to import claims, service lines, and diagnoses."
           accent="blue"
+          onUploadComplete={handleUploadComplete}
         />
         <UploadCard
           title="835 — Remittance / Payment"
           description="Upload an 835 file to import payment data, adjustments, and remark codes."
           accent="emerald"
+          onUploadComplete={handleUploadComplete}
         />
       </div>
+
+      {/* Row 2: Recommended Fixes — only rendered when there is an actionable fix */}
+      {showRecommendationRow && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-10">
+          <RecommendedFixesPanel
+            data={rec837.data}
+            loading={rec837.loading}
+            error={rec837.error}
+            title="Recommended Fixes — 837 Submission"
+            subtitle="High-risk and denied claims from the latest 837 upload, with ML- and parser-derived fixes."
+            emptyText="Recommendations will appear here after the next 837 upload."
+          />
+          <RecommendedFixesPanel
+            data={rec835.data}
+            loading={rec835.loading}
+            error={rec835.error}
+            title="Recommended Fixes — 835 Adjudication"
+            subtitle="Denied claims from the latest 835 upload, with CARC-derived fixes."
+            emptyText="Recommendations will appear here after the next 835 upload."
+          />
+        </div>
+      )}
 
       <h1 className="text-2xl font-bold text-gray-900 mt-10 mb-6">Model Training</h1>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import date as date_cls
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.claim import Claim
@@ -230,16 +230,49 @@ class EdiParser:
             db.add(ctx.edi_file)
             await db.flush()
 
-            # 2. Claims → set edi_file_id, flush to get ids
+            # 2. Claims → set edi_file_id, dedupe intra-file claim_number
+            #    collisions, flush to get ids.
+            #
+            #    Real-world / synthetic 837 batches occasionally carry multiple
+            #    CLM segments that share the same CLM01 (e.g. multiple service
+            #    encounters billed under the same patient account number with
+            #    different facility types). The DB has a UNIQUE constraint on
+            #    (edi_file_id, claim_number); without this dedup the whole
+            #    transaction rolls back and no claims persist.
+            #
+            #    Dedup rule: the first occurrence keeps the original CLM01;
+            #    subsequent duplicates get a suffix "__dupN" so they can be
+            #    persisted. The original EDI claim_number remains recoverable
+            #    from each row's raw_claim_segment (the CLM* text is stored
+            #    verbatim). Persistent traceability without a schema change.
+            original_claim_numbers: list[str] = []
+            seen_counts: dict[str, int] = {}
             for claim in ctx.claims:
                 claim.edi_file_id = ctx.edi_file.id
+                original_cn = claim.claim_number
+                original_claim_numbers.append(original_cn)
+                n = seen_counts.get(original_cn, 0)
+                if n > 0:
+                    claim.claim_number = f"{original_cn}__dup{n}"
+                    logger.info(
+                        "Deduped CLM01 collision in %s: %r -> %r",
+                        ctx.edi_file.file_name,
+                        original_cn,
+                        claim.claim_number,
+                    )
+                seen_counts[original_cn] = n + 1
+
             db.add_all(ctx.claims)
             await db.flush()
 
-            # In-memory claim_number → id map (for 835 resolution)
-            local_claim_map: dict[str, int] = {
-                c.claim_number: c.id for c in ctx.claims
-            }
+            # In-memory claim_number → id map (for 835 resolution within this
+            # same parse). Keyed by ORIGINAL CLM01 so an inbound 835's CLP01
+            # still resolves to the first-occurrence claim. The suffixed
+            # duplicates are reachable via DB lookup with a LIKE pattern in
+            # Tier 2 of _resolve_remittance_claim_ids when needed.
+            local_claim_map: dict[str, int] = {}
+            for original_cn, claim in zip(original_claim_numbers, ctx.claims):
+                local_claim_map.setdefault(original_cn, claim.id)
 
             # 2b. Claim lifecycles → link resubmission/correction chains
             await self._build_claim_lifecycles(ctx, db)
@@ -316,11 +349,22 @@ class EdiParser:
             # Tier 1
             claim_id = local_claim_map.get(claim_number)
 
-            # Tier 2
+            # Tier 2 — choose deterministically when multiple claims share
+            # the same claim_number (original + replacement). Prefer a claim
+            # that doesn't yet have any remittance attached; break ties by
+            # most-recent claim id (the later upload, typically the
+            # replacement when 835s arrive in order).
             if claim_id is None:
+                rem_count = (
+                    select(func.count(RemittanceClaim.id))
+                    .where(RemittanceClaim.claim_id == Claim.id)
+                    .scalar_subquery()
+                    .label("rem_count")
+                )
                 stmt = (
                     select(Claim.id)
                     .where(Claim.claim_number == claim_number)
+                    .order_by(rem_count.asc(), Claim.id.desc())
                     .limit(1)
                 )
                 row = (await db.execute(stmt)).scalar_one_or_none()

@@ -32,7 +32,7 @@ from app.ml.dataset import build_dataset, get_dataset_stats
 from app.ml.feature_engineering import FEATURE_COLUMNS, FeatureEngineer
 from app.models.training_metric import TrainingMetric
 
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v2"
 
 logger = logging.getLogger(__name__)
 

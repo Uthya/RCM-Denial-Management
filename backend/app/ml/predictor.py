@@ -49,10 +49,18 @@ FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "missing_diagnosis": "Missing Diagnosis",
     "missing_procedure": "Missing Procedure",
     "missing_pos": "Missing Place of Service",
+    "payer_cpt_denial_rate": "Payer × Procedure History",
+    "payer_dx_denial_rate": "Payer × Diagnosis History",
+    "payer_pos_denial_rate": "Payer × Place of Service History",
+    "payer_volume": "Payer Claim Volume",
+    "cpt_volume": "Procedure Claim Volume",
+    "dx_volume": "Diagnosis Claim Volume",
+    "is_rare_payer": "Rare Payer",
+    "is_rare_cpt": "Rare Procedure",
 }
 
-MODEL_VERSION = "v1"
-FEATURE_VERSION = "v2"
+MODEL_VERSION = "v2"
+FEATURE_VERSION = "v3"
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from app.routers import (
     denials,
     edi,
     predictions,
+    recommendations,
     training_history,
 )
 
@@ -44,6 +45,9 @@ app.include_router(appeals.router, prefix="/api/appeals", tags=["Appeals"])
 app.include_router(predictions.router, prefix="/api/predictions", tags=["Predictions"])
 app.include_router(edi.router, prefix="/api/edi", tags=["EDI"])
 app.include_router(training_history.router, prefix="/api/ml", tags=["ML"])
+app.include_router(
+    recommendations.router, prefix="/api/recommendations", tags=["Recommendations"]
+)
 
 
 @app.get("/health")

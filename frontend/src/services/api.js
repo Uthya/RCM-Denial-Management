@@ -58,4 +58,9 @@ export const getTrainingHistory = ({ skip = 0, limit = 20 } = {}) =>
 
 export const getLatestTraining = () => api.get('/ml/latest-training');
 
+export const getRecommendationsByFile = (ediFileId, validationErrors = []) =>
+  api.post(`/recommendations/by-file/${ediFileId}`, {
+    validation_errors: validationErrors,
+  });
+
 export default api;

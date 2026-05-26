@@ -1,7 +1,7 @@
 """Feature engineering for claim-level denial prediction.
 
 Transforms the raw DataFrame from ``dataset.build_dataset()`` into a
-23-feature numeric matrix suitable for XGBoost training and inference.
+31-feature numeric matrix suitable for XGBoost training and inference.
 """
 
 from __future__ import annotations
@@ -20,7 +20,37 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-FEATURE_ENGINEERING_VERSION = "v2"
+FEATURE_ENGINEERING_VERSION = "v3"
+
+# Sentinel string used when stringifying nullable categorical values for joint
+# keys. Keeps the joint cardinality meaningful (e.g. "ACME||missing") instead
+# of producing NaN-containing keys that TargetEncoder would treat oddly.
+_MISSING_SENTINEL = "__missing__"
+
+# Volume thresholds for rarity flags. Tuned for the current dataset; the
+# specific numbers matter less than the *concept* — they tell the model when
+# a category is statistically thin and the TargetEncoder estimate is noisy.
+_RARE_PAYER_THRESHOLD = 50
+_RARE_CPT_THRESHOLD = 10
+_RARE_DX_THRESHOLD = 10
+
+# Joint keys whose denial rate the model should see directly. Pairs are
+# encoded as a synthetic string column "value_a||value_b" then run through a
+# dedicated TargetEncoder with the same 5-fold CV used for single columns.
+_JOINT_KEYS: list[tuple[str, str]] = [
+    ("payer_name", "primary_procedure_code"),
+    ("payer_name", "primary_diagnosis_code"),
+    ("payer_name", "place_of_service"),
+]
+
+# Columns whose training-time frequency the model should see directly. Rare
+# values get small volume counts → the model can learn to trust the encoded
+# denial rate less for them.
+_VOLUME_COLUMNS: list[str] = [
+    "payer_name",
+    "primary_procedure_code",
+    "primary_diagnosis_code",
+]
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -73,6 +103,19 @@ FEATURE_COLUMNS: list[str] = [
     "missing_diagnosis",
     "missing_procedure",
     "missing_pos",
+    # Joint / cross-key denial-rate aggregations (v3) — give the model the
+    # denial rate of (payer × CPT), (payer × dx), (payer × POS) pairs
+    # directly, instead of forcing tree splits to discover the interaction.
+    "payer_cpt_denial_rate",
+    "payer_dx_denial_rate",
+    "payer_pos_denial_rate",
+    # Volume / reliability features (v3) — training-time counts so the model
+    # can downweight encoded denial rates from sparsely-observed categories.
+    "payer_volume",
+    "cpt_volume",
+    "dx_volume",
+    "is_rare_payer",
+    "is_rare_cpt",
 ]
 
 
@@ -114,6 +157,14 @@ _FEATURE_METADATA: list[FeatureMeta] = [
     FeatureMeta("missing_diagnosis", "int64", "primary_diagnosis_code", "is null"),
     FeatureMeta("missing_procedure", "int64", "primary_procedure_code", "is null"),
     FeatureMeta("missing_pos", "int64", "place_of_service", "is null"),
+    FeatureMeta("payer_cpt_denial_rate", "float64", "payer_name × primary_procedure_code", "joint TargetEncoder"),
+    FeatureMeta("payer_dx_denial_rate", "float64", "payer_name × primary_diagnosis_code", "joint TargetEncoder"),
+    FeatureMeta("payer_pos_denial_rate", "float64", "payer_name × place_of_service", "joint TargetEncoder"),
+    FeatureMeta("payer_volume", "int64", "payer_name", "training count"),
+    FeatureMeta("cpt_volume", "int64", "primary_procedure_code", "training count"),
+    FeatureMeta("dx_volume", "int64", "primary_diagnosis_code", "training count"),
+    FeatureMeta("is_rare_payer", "int64", "payer_name", f"payer_volume < {_RARE_PAYER_THRESHOLD}"),
+    FeatureMeta("is_rare_cpt", "int64", "primary_procedure_code", f"cpt_volume < {_RARE_CPT_THRESHOLD}"),
 ]
 
 
@@ -189,11 +240,21 @@ class FeatureEngineer:
         "service_duration_days",
         "line_count",
         "diagnosis_count",
+        "payer_volume",
+        "cpt_volume",
+        "dx_volume",
+        "is_rare_payer",
+        "is_rare_cpt",
     ]
 
     def __init__(self) -> None:
         self.target_encoder_: TargetEncoder | None = None
+        self.joint_target_encoder_: TargetEncoder | None = None
         self.high_charge_threshold_: float | None = None
+        # Per-category training-set counts, keyed by source column name.
+        # Used at inference to surface "how often did we see this value"
+        # without having to re-scan the training set.
+        self.volume_lookups_: dict[str, dict[str, int]] | None = None
         self._is_fitted: bool = False
 
     # ---- private helpers -------------------------------------------------
@@ -276,6 +337,81 @@ class FeatureEngineer:
             cat_df[col] = cat_df[col].astype(str).replace("nan", np.nan).replace("None", np.nan)
         return cat_df
 
+    @staticmethod
+    def _stringify(series: pd.Series) -> pd.Series:
+        """Stringify a column, replacing nulls with a fixed sentinel.
+
+        Used when constructing joint keys — null values must collapse to a
+        consistent token so e.g. ``"ACME||{missing}"`` is one category, not a
+        scattered set of distinct keys.
+        """
+        return (
+            series.astype(str)
+            .replace("nan", _MISSING_SENTINEL)
+            .replace("None", _MISSING_SENTINEL)
+        )
+
+    def _build_joint_input(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Build the synthetic joint-key DataFrame consumed by the joint encoder."""
+        out = pd.DataFrame(index=df.index)
+        for col_a, col_b in _JOINT_KEYS:
+            name = f"{col_a}||{col_b}"
+            out[name] = self._stringify(df[col_a]) + "||" + self._stringify(df[col_b])
+        return out
+
+    def _compute_volume_lookups(self, df: pd.DataFrame) -> dict[str, dict[str, int]]:
+        """Precompute training-time value counts for each tracked column."""
+        lookups: dict[str, dict[str, int]] = {}
+        for col in _VOLUME_COLUMNS:
+            counts = self._stringify(df[col]).value_counts()
+            lookups[col] = counts.to_dict()
+        return lookups
+
+    def _apply_joint_encoding(
+        self, out: pd.DataFrame, df: pd.DataFrame, *, is_training: bool, y=None
+    ) -> None:
+        """Append the three joint denial-rate columns to ``out``.
+
+        During training (``is_training=True``) we call ``fit_transform`` on the
+        joint encoder so each row gets out-of-fold target rates (matching the
+        leakage-safe behaviour of the per-column TargetEncoder). At inference
+        we call ``transform`` only.
+        """
+        joint_df = self._build_joint_input(df)
+        if is_training:
+            self.joint_target_encoder_ = TargetEncoder(
+                target_type="binary",
+                smooth="auto",
+                cv=5,
+                random_state=42,
+            )
+            encoded = self.joint_target_encoder_.fit_transform(joint_df, y)
+        else:
+            assert self.joint_target_encoder_ is not None
+            encoded = self.joint_target_encoder_.transform(joint_df)
+
+        # Maintain a stable column order: payer_cpt, payer_dx, payer_pos.
+        out["payer_cpt_denial_rate"] = encoded[:, 0]
+        out["payer_dx_denial_rate"] = encoded[:, 1]
+        out["payer_pos_denial_rate"] = encoded[:, 2]
+
+    def _apply_volume_features(self, out: pd.DataFrame, df: pd.DataFrame) -> None:
+        """Append per-category training-count columns + rarity flags to ``out``."""
+        assert self.volume_lookups_ is not None
+        payer_counts = self.volume_lookups_.get("payer_name", {})
+        cpt_counts = self.volume_lookups_.get("primary_procedure_code", {})
+        dx_counts = self.volume_lookups_.get("primary_diagnosis_code", {})
+
+        payer_vol = self._stringify(df["payer_name"]).map(payer_counts).fillna(0)
+        cpt_vol = self._stringify(df["primary_procedure_code"]).map(cpt_counts).fillna(0)
+        dx_vol = self._stringify(df["primary_diagnosis_code"]).map(dx_counts).fillna(0)
+
+        out["payer_volume"] = payer_vol.astype("int64")
+        out["cpt_volume"] = cpt_vol.astype("int64")
+        out["dx_volume"] = dx_vol.astype("int64")
+        out["is_rare_payer"] = (payer_vol < _RARE_PAYER_THRESHOLD).astype("int64")
+        out["is_rare_cpt"] = (cpt_vol < _RARE_CPT_THRESHOLD).astype("int64")
+
     # ---- fit / transform / fit_transform --------------------------------
 
     def fit(self, df: pd.DataFrame) -> FeatureEngineer:
@@ -301,6 +437,19 @@ class FeatureEngineer:
         )
         self.target_encoder_.fit(cat_df, y)
 
+        # Joint-key TargetEncoder for cross-column denial rates.
+        joint_df = self._build_joint_input(df)
+        self.joint_target_encoder_ = TargetEncoder(
+            target_type="binary",
+            smooth="auto",
+            cv=5,
+            random_state=42,
+        )
+        self.joint_target_encoder_.fit(joint_df, y)
+
+        # Volume lookups for reliability features.
+        self.volume_lookups_ = self._compute_volume_lookups(df)
+
         # 75th percentile threshold for high_charge_claim
         self.high_charge_threshold_ = float(
             df["total_charge_amount"].quantile(0.75)
@@ -310,7 +459,7 @@ class FeatureEngineer:
         return self
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Produce the 23-column feature matrix from a raw DataFrame."""
+        """Produce the 31-column feature matrix from a raw DataFrame."""
         if not self._is_fitted:
             raise RuntimeError("FeatureEngineer has not been fitted. Call fit() first.")
 
@@ -326,6 +475,10 @@ class FeatureEngineer:
         )
         for col in encoded_df.columns:
             out[col] = encoded_df[col]
+
+        # 24-31: Joint denial-rate aggregations + volume / reliability features.
+        self._apply_joint_encoding(out, df, is_training=False)
+        self._apply_volume_features(out, df)
 
         return self._finalize(out, df)
 
@@ -349,6 +502,9 @@ class FeatureEngineer:
             df["total_charge_amount"].quantile(0.75)
         )
 
+        # Volume lookups (target-independent, so compute up front).
+        self.volume_lookups_ = self._compute_volume_lookups(df)
+
         out = self._build_base_features(df)
 
         # TargetEncoder — fit_transform uses internal CV to avoid leakage
@@ -368,6 +524,12 @@ class FeatureEngineer:
         for col in encoded_df.columns:
             out[col] = encoded_df[col]
 
+        # Joint denial-rate aggregations (also CV-folded internally).
+        self._apply_joint_encoding(out, df, is_training=True, y=y)
+
+        # Volume / rarity features.
+        self._apply_volume_features(out, df)
+
         self._is_fitted = True
         return self._finalize(out, df)
 
@@ -384,6 +546,8 @@ class FeatureEngineer:
         state = {
             "version": FEATURE_ENGINEERING_VERSION,
             "target_encoder": self.target_encoder_,
+            "joint_target_encoder": self.joint_target_encoder_,
+            "volume_lookups": self.volume_lookups_,
             "high_charge_threshold": self.high_charge_threshold_,
             "feature_columns": FEATURE_COLUMNS,
         }
@@ -415,6 +579,8 @@ class FeatureEngineer:
 
         instance = cls()
         instance.target_encoder_ = state["target_encoder"]
+        instance.joint_target_encoder_ = state.get("joint_target_encoder")
+        instance.volume_lookups_ = state.get("volume_lookups")
         instance.high_charge_threshold_ = state["high_charge_threshold"]
         instance._is_fitted = True
         return instance
