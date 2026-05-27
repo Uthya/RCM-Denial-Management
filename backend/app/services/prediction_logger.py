@@ -55,6 +55,19 @@ def _label_from_risk(risk_score: float) -> int:
     return 1 if risk_score >= 0.5 else 0
 
 
+def _resolve_label(prediction_result: dict, risk_score: float) -> int:
+    """Prefer the predictor's label (tuned threshold); fall back to 0.5.
+
+    Newer predictions carry ``predicted_label`` computed at the model's tuned
+    decision threshold. Older results (pre-calibration) don't, so we derive it
+    from the 0.5 rule to stay backward compatible.
+    """
+    label = prediction_result.get("predicted_label")
+    if label is not None:
+        return int(label)
+    return _label_from_risk(risk_score)
+
+
 def _row_from_prediction(
     *,
     claim_id: int | None,
@@ -78,7 +91,7 @@ def _row_from_prediction(
         claim_number=claim_number,
         prediction_id=prediction_result["prediction_id"],
         predicted_risk=risk_score,
-        predicted_label=_label_from_risk(risk_score),
+        predicted_label=_resolve_label(prediction_result, risk_score),
         risk_level=prediction_result["risk_level"],
         model_version=prediction_result.get("model_version", "unknown"),
         feature_engineering_version=prediction_result.get(

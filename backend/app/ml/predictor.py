@@ -8,9 +8,11 @@ features with human-readable names.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 
+import joblib
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
@@ -59,8 +61,12 @@ FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "is_rare_cpt": "Rare Procedure",
 }
 
-MODEL_VERSION = "v2"
+MODEL_VERSION = "v3.2"
 FEATURE_VERSION = "v3"
+
+# Fallback when no calibrator artifact is present (older models): use raw
+# scores and the classic 0.5 cutoff so prediction never hard-fails.
+DEFAULT_THRESHOLD = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +79,8 @@ class DenialPredictor:
     def __init__(self) -> None:
         self.model: XGBClassifier | None = None
         self.engineer: FeatureEngineer | None = None
+        self.calibrator = None
+        self.threshold: float = DEFAULT_THRESHOLD
         self._loaded = False
 
     def load(self) -> bool:
@@ -88,6 +96,30 @@ class DenialPredictor:
             logger.exception("Failed to load FeatureEngineer from %s", settings.ML_ENCODERS_PATH)
             self.model = None
             return False
+
+        # Calibrator + tuned threshold are optional: a model trained before
+        # calibration existed still serves, just with raw scores at 0.5.
+        self.calibrator = None
+        self.threshold = DEFAULT_THRESHOLD
+        try:
+            if os.path.exists(settings.ML_CALIBRATOR_PATH):
+                bundle = joblib.load(settings.ML_CALIBRATOR_PATH)
+                self.calibrator = bundle.get("calibrator")
+                self.threshold = float(bundle.get("threshold", DEFAULT_THRESHOLD))
+                logger.info(
+                    "Loaded calibrator (method=%s, threshold=%.4f)",
+                    bundle.get("method", "unknown"),
+                    self.threshold,
+                )
+            else:
+                logger.warning(
+                    "No calibrator at %s; serving raw scores at 0.5 threshold",
+                    settings.ML_CALIBRATOR_PATH,
+                )
+        except Exception:
+            logger.exception("Failed to load calibrator; falling back to raw scores")
+            self.calibrator = None
+            self.threshold = DEFAULT_THRESHOLD
 
         self._loaded = True
         logger.info("DenialPredictor loaded successfully")
@@ -119,19 +151,37 @@ class DenialPredictor:
         # Transform through the feature pipeline
         features = self.engineer.transform(df)
 
-        # Predict probability of denial (class 1)
+        # Raw model probability of denial (class 1)
         proba = self.model.predict_proba(features)
-        risk_score = float(proba[0, 1])
+        raw_score = float(proba[0, 1])
 
-        # Risk level
-        risk_level = _classify_risk(risk_score)
+        # Calibrate to a true probability (isotonic). The risk_score we expose
+        # is the calibrated value so "0.7" means ~70% denial likelihood, which
+        # is what risk_level and the decision threshold are defined against.
+        if self.calibrator is not None:
+            cal = float(self.calibrator.transform([raw_score])[0])
+            risk_score = min(max(cal, 0.0), 1.0)
+        else:
+            risk_score = raw_score
 
-        # Feature contributions via XGBoost booster pred_contribs
+        # Risk level (on the calibrated score), tied to the decision threshold:
+        # HIGH == would be predicted denied, MEDIUM == borderline, LOW == clear.
+        risk_level = _classify_risk(risk_score, self.threshold)
+
+        # Binary decision at the tuned threshold (not a hardcoded 0.5).
+        predicted_label = int(risk_score >= self.threshold)
+
+        # Feature contributions via XGBoost booster pred_contribs. Computed on
+        # the raw model (calibration is a monotonic post-transform and does not
+        # change feature attributions), so explainability is unaffected.
         top_risk_factors = self._compute_contributions(features)
 
         return {
             "prediction_id": str(uuid.uuid4()),
             "risk_score": round(risk_score, 4),
+            "raw_risk_score": round(raw_score, 4),
+            "predicted_label": predicted_label,
+            "decision_threshold": round(self.threshold, 4),
             "risk_level": risk_level,
             "top_risk_factors": top_risk_factors,
             "model_version": MODEL_VERSION,
@@ -189,13 +239,21 @@ class DenialPredictor:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _classify_risk(score: float) -> str:
-    if score < 0.3:
-        return "LOW"
-    elif score <= 0.7:
-        return "MEDIUM"
-    else:
+def _classify_risk(score: float, threshold: float = DEFAULT_THRESHOLD) -> str:
+    """Bucket a calibrated probability relative to the decision threshold.
+
+    Tying buckets to the threshold (instead of fixed 0.3/0.7 cutoffs designed
+    for the old uncalibrated scores) keeps the label coherent with the binary
+    decision and stops genuinely-deniable claims from hiding in "LOW":
+      - HIGH   : score >= threshold  (i.e. predicted denied)
+      - MEDIUM : half the threshold <= score < threshold (borderline / watch)
+      - LOW    : score < half the threshold (well clear of the decision line)
+    """
+    if score >= threshold:
         return "HIGH"
+    if score >= 0.5 * threshold:
+        return "MEDIUM"
+    return "LOW"
 
 
 # ---------------------------------------------------------------------------

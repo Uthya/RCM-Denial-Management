@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -292,11 +292,29 @@ async def dataset_stats(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/train")
-async def train_denial_model(db: AsyncSession = Depends(get_db)):
+async def train_denial_model(
+    db: AsyncSession = Depends(get_db),
+    tune: bool = Query(
+        True,
+        description="Tune hyperparameters with Optuna (cross-validated on the "
+        "training split). Disable for a fast baseline model.",
+    ),
+    n_trials: int = Query(
+        30, ge=1, le=200, description="Maximum Optuna trials when tuning."
+    ),
+    tuning_timeout: int | None = Query(
+        180,
+        ge=1,
+        description="Wall-clock budget for tuning in seconds. Tuning stops at "
+        "whichever of n_trials or this limit comes first.",
+    ),
+):
     from app.ml.trainer import train_model
     from app.ml.predictor import get_predictor
     try:
-        result = await train_model(db)
+        result = await train_model(
+            db, tune=tune, n_trials=n_trials, tuning_timeout=tuning_timeout
+        )
         # Reload the singleton predictor so it picks up the new artifacts
         get_predictor().load()
         return result

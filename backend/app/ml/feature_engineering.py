@@ -14,6 +14,7 @@ from typing import ClassVar
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import TargetEncoder
 
 from app.core.config import settings
@@ -219,10 +220,14 @@ def _validate_features(df: pd.DataFrame) -> None:
 # FeatureEngineer
 # ---------------------------------------------------------------------------
 
-class FeatureEngineer:
-    """Transforms a raw claim DataFrame into a 23-feature numeric matrix.
+class FeatureEngineer(BaseEstimator, TransformerMixin):
+    """Transforms a raw claim DataFrame into the numeric feature matrix.
 
-    Follows the scikit-learn fit/transform convention.
+    A proper scikit-learn transformer (``BaseEstimator`` + ``TransformerMixin``)
+    so it can be dropped into a ``Pipeline`` and cloned/refit inside each
+    cross-validation fold. Fitting per fold is what keeps the target encoders
+    from ever seeing validation/test labels — the leakage-free guarantee the
+    tuning pipeline relies on.
     """
 
     _BOOL_INT_FEATURES: ClassVar[list[str]] = [
@@ -414,18 +419,32 @@ class FeatureEngineer:
 
     # ---- fit / transform / fit_transform --------------------------------
 
-    def fit(self, df: pd.DataFrame) -> FeatureEngineer:
-        """Fit encoders and thresholds from the training DataFrame.
+    @staticmethod
+    def _resolve_target(df: pd.DataFrame, y) -> np.ndarray:
+        """Return the binary target as an int array.
 
-        Requires a ``denied`` column (the binary target) for TargetEncoder.
+        Accepts an explicit ``y`` (scikit-learn ``fit(X, y)`` convention, used
+        by the CV pipeline) or falls back to a ``denied`` column on ``df`` for
+        direct callers. Converting to a positionally-aligned array avoids any
+        index-label surprises when sklearn hands us a fold subset.
         """
-        if "denied" not in df.columns:
-            raise ValueError(
-                "Training DataFrame must contain a 'denied' column "
-                "(binary target) for TargetEncoder fitting."
-            )
+        if y is None:
+            if "denied" not in df.columns:
+                raise ValueError(
+                    "Target not provided: pass y to fit()/fit_transform() or "
+                    "include a 'denied' column."
+                )
+            y = df["denied"]
+        return np.asarray(y).astype(int)
 
-        y = df["denied"].astype(int)
+    def fit(self, X: pd.DataFrame, y=None) -> FeatureEngineer:
+        """Fit encoders and thresholds from the training data.
+
+        The target may be passed explicitly as ``y`` (sklearn convention) or
+        read from a ``denied`` column on ``X``.
+        """
+        df = X
+        y = self._resolve_target(df, y)
 
         # TargetEncoder — fit on all 6 categorical columns at once
         cat_df = self._prepare_categorical_input(df)
@@ -482,20 +501,19 @@ class FeatureEngineer:
 
         return self._finalize(out, df)
 
-    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    def fit_transform(self, X: pd.DataFrame, y=None) -> pd.DataFrame:
         """Fit and transform in one step.
 
         Uses TargetEncoder.fit_transform() which applies internal cross-fitting
-        (5-fold CV) so that each training sample is encoded using target
-        statistics from other folds, preventing target leakage.
-        """
-        if "denied" not in df.columns:
-            raise ValueError(
-                "Training DataFrame must contain a 'denied' column "
-                "(binary target) for TargetEncoder fitting."
-            )
+        (5-fold CV) so each training row is encoded using target statistics from
+        *other* folds. Combined with refitting inside each outer CV fold (via
+        ``Pipeline``), validation/test rows never influence their own encoding.
 
-        y = df["denied"].astype(int)
+        The target may be passed explicitly as ``y`` (sklearn convention) or
+        read from a ``denied`` column on ``X``.
+        """
+        df = X
+        y = self._resolve_target(df, y)
 
         # 75th percentile threshold for high_charge_claim
         self.high_charge_threshold_ = float(

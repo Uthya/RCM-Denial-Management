@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     ML_ENCODERS_PATH: str = "app/ml/artifacts/feature_encoders.joblib"
     ML_METRICS_PATH: str = "app/ml/artifacts/training_metrics.json"
     ML_DISTRIBUTIONS_PATH: str = "app/ml/artifacts/training_distributions.json"
+    ML_CALIBRATOR_PATH: str = "app/ml/artifacts/calibrator.joblib"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
