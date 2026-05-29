@@ -73,6 +73,11 @@ export const getLivePerformance = ({ days = 30, model_version } = {}) =>
 export const getDriftReport = ({ days = 7 } = {}) =>
   api.get('/monitoring/drift', { params: { days } });
 
+export const getUnseenRate = ({ days = 7, model_version, top_n = 10 } = {}) =>
+  api.get('/monitoring/unseen-rate', {
+    params: { days, model_version, top_n },
+  });
+
 export const getPredictionLog = ({
   limit = 50,
   offset = 0,

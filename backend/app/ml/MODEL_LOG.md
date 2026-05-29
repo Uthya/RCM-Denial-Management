@@ -11,9 +11,180 @@ Conventions:
 
 ---
 
+## v3.4 — Training-pipeline optimizations (no scoring change; 155 s → 100 s full / 62 s warm)
+
+**Date:** 2026-05-28 · **Status:** infra-only; v3.4 model unchanged
+
+Infrastructure-only follow-up — no model semantics changed, no version bump. The deployed v3.4 model, calibration, thresholds, and risk buckets are byte-for-byte equivalent to what they were before. This entry documents the **training pipeline becoming faster**, not the model becoming different.
+
+**Changes:**
+
+1. **Pre-engineered CV fold cache during Optuna tuning.** The CV fold splits are deterministic (`StratifiedKFold(random_state=42)`) but the previous loop refit `FeatureEngineer` from scratch inside every trial's every fold — that work is identical across trials. Now the engineered fold matrices are computed once before the Optuna loop and reused across all trials. Leakage-safe by construction: each fold's engineer is fit on that fold's training rows only, same isolation as the prior `cross_val_score(Pipeline(FE, XGB))`.
+2. **Adaptive Optuna trial budget.** `_adaptive_n_trials(N)` returns 5 / 10 / 20 / 30 trials for `N < 500 / < 5k / < 50k / ≥ 50k`. Honored when `n_trials` isn't explicitly passed.
+3. **Early-stop callback on convergence.** Optuna study aborts when the best PR-AUC has not improved by ≥ `1e-3` over the last 5 trials. On this data TPE converges in trials 1–6; the rest was waste.
+4. **Three retrain modes:** `full`, `warm`, `quick`, exposed via `--mode` CLI flag and `?mode=` query param on `/api/predictions/train`.
+   - **Full**: Optuna search + 5-fold isotonic calibration. Default.
+   - **Warm**: reuse last good hyperparameters from `training_metrics.json` (refuses if `MODEL_VERSION` or `FEATURE_ENGINEERING_VERSION` mismatch). Skip Optuna entirely.
+   - **Quick**: warm + 3-fold calibration. For development.
+5. **Per-stage timing instrumentation.** `_StageTimer` captures tuning / calibration / deploy_fit wall-clock; surfaced in `result["stage_timings_seconds"]` and the metrics artifact.
+6. **Quality regression guard.** After every training, `_check_quality_regression` compares the new test metrics against the prior `training_metrics.json` and warns (does not block) on PR-AUC drop > 0.01, recall drop > 2 pp, or Brier rise > 0.005. Surfaced as `result["quality_check"]`.
+
+**Benchmark on the production 177k dataset (same seed, same model):**
+
+| Mode | Total time | Tuning | Calibration | Deploy fit | PR-AUC | ROC-AUC | Recall | Precision | Brier | Regression check |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Baseline (pre-fix) | ~155 s | ~120 s | ~20 s | ~10 s | 0.9220 | 0.9789 | 0.832 | 0.860 | 0.0264 | n/a |
+| **Full (optimized)** | **99.9 s** | 34.1 s | 15.7 s | 3.7 s | 0.9220 | 0.9789 | 0.837 | 0.858 | 0.0264 | ok |
+| **Warm** | **61.9 s** | 0.0 s | 15.3 s | 3.5 s | 0.9220 | 0.9789 | 0.837 | 0.858 | 0.0264 | ok |
+| **Quick** | **58.4 s** | 0.0 s | 9.2 s | 4.0 s | 0.9219 | 0.9788 | 0.850 | 0.839 | 0.0264 | ok |
+
+**Speedup:** 155 s → 100 s full retrain (**35% reduction**), 155 s → 62 s warm (**60% reduction**), 155 s → 58 s quick (**62% reduction**). All three modes pass the quality regression check.
+
+**Pros:** Leakage-safe by construction (cache scoped per-fold, FE never sees val rows); zero model-quality regression at any mode; the warm/quick modes refuse to run with stale artifacts (`MODEL_VERSION` / `FEATURE_VERSION` mismatch falls back to full); per-stage timings make future optimization observable.
+**Cons:** Cache adds ~150–250 MB peak memory during tuning (acceptable on any modern host); the early-stop patience (5) is tuned for this dataset's convergence — pathologically rugged loss landscapes could underspend (override via explicit `--n-trials`).
+
+---
+
+## v3.4 — Tighter LOW bucket + 5-fold calibration (LOW-but-denied: 1.63% → 0.87%)
+
+**Date:** 2026-05-28 · **Status:** deployed (current)
+
+**Trigger:** Operator-reported "many medium or low risk claims are being denied — medium is acceptable but low is not." Diagnostic on the 35,473-claim test split confirmed: the LOW bucket was emitting 1.63% real-world denial rate (492 of 30,154 LOW claims denied). The model's *calibration* was already honest (Brier 0.027; per-bin gap ≤4 pp across 10 bins) — the problem was the **bucket definition**, not the probabilities.
+
+**Changes from v3.3:**
+1. **LOW bucket detached from threshold and tightened.** Old rule: `LOW < 0.5 * τ` (~0.17); new rule: `LOW < 0.05` (fixed). MEDIUM widens to absorb the difference; HIGH unchanged (still `>= τ`). New constant `LOW_PROB_CUTOFF = 0.05` in `predictor.py`. `_classify_risk` updated.
+2. **Calibration CV folds 3 → 5.** Finer-grained out-of-fold probability estimation, especially in the low-score region where ~85% of the test set lives. OOF Brier improved 0.037 → 0.026.
+
+**Benefit gained (test split, 35,473 claims):**
+| Bucket | n | denial rate v3.3 | denial rate v3.4 |
+|---|---|---|---|
+| LOW | 30,154 → 26,784 | **1.63%** | **0.87%** |
+| MEDIUM | 1,022 → 4,392 | 24.6% | 11.6% |
+| HIGH | 4,297 | 86.0% | 86.0% |
+
+- **LOW-but-denied claims dropped 492 → 233** (53% reduction). "LOW = safe to ignore" now matches reality (~1 in 115 will deny).
+- MEDIUM moved from "near-HIGH" (24.6%) to genuinely borderline (11.6%) — operationally useful as a "review-worthy" tier.
+- HIGH semantics fully preserved (still `score >= τ`, same precision/recall trade-off).
+
+**Pros:** Bucket labels now match operator intuition; no change to discrimination (ROC-AUC, PR-AUC, decision threshold all stable); 5-fold calibration gives marginally cleaner OOF probabilities; zero schema or API change.
+**Cons:** MEDIUM bucket population grew ~4×, so dashboards showing MEDIUM counts will look very different in v3.4 (more claims flagged for review); this is intentional but worth communicating to billers.
+
+**Hyperparameters / artifacts:** same Optuna-tuned XGBoost (`n_estimators=175, max_depth=10, scale_pos_weight≈16`), same precision-floor threshold strategy. Threshold landed at **0.3163** (within ~5% of v3.3's 0.3333 — minor float drift; not a semantics change).
+
+**Metrics (test):**
+| Recall | Precision | F1 | Accuracy | ROC-AUC | PR-AUC | Brier (cal) | Threshold |
+|---|---|---|---|---|---|---|---|
+| 0.832 | 0.860 | 0.846 | 0.962 | 0.979 | 0.922 | 0.027 | 0.3163 |
+
+ROC-AUC ticked up 0.968 → 0.979 (the now-larger training set including QX/AB/NX added discrimination signal).
+
+---
+
+## v3.3 — ML correctness pass: CAS-parser fix, unseen-category flags, strict-fail artifacts
+
+**Date:** 2026-05-28 · **Status:** superseded by v3.4
+
+**Changes from v3.2:** This is a correctness-focused release. The model
+architecture (XGBoost + isotonic calibration + precision-floor threshold)
+is unchanged; data flowing into it improved, and the deployment surface got
+hard contracts.
+
+1. **CAS parser stride bug fixed** (`services/parsers/handlers.py`). The
+   X12 005010 CAS triplet (reason, amount, quantity) was being mis-parsed
+   for payers that omit empty quantity slots: the old stride-3 loop lost
+   secondary triplets, mis-attributing denial dollars to wrong CARC codes.
+   The new `_parse_cas_triplets` handles spec form, compact form, and
+   mixed/malformed segments; quantity is now captured into the new
+   `adjustments.quantity` column (alembic migration `b81a3f72c4d2`).
+   **Impact:** CARC→dollar attribution is correct; recommendations driven
+   by remittance adjustments are now trustworthy. 19 unit tests cover the
+   forms (`tests/test_cas_parser.py`).
+
+2. **Feature engineering bumped v3 → v4** with explicit unseen-category
+   indicators (`feature_engineering.py`): `unseen_payer`, `unseen_cpt`,
+   `unseen_dx`, `unseen_any`. Training-time vocabularies are persisted in
+   the engineer artifact; at inference, an out-of-vocabulary payer/CPT/Dx
+   now flags as "unseen" rather than collapsing into "low encoded value
+   like a zero-denial seen value." Feature count grew 31 → 35.
+
+3. **Strict-fail artifact loading.** `FeatureEngineer.load` raises
+   `ValueError` (not a warning) on `feature_engineering_version` or
+   `feature_columns` mismatch. `DenialPredictor.load` raises on
+   `calibrator.model_version` ≠ `predictor.MODEL_VERSION`. A new
+   `n_features_in_` check inside `predict()` guards against silent column
+   drift. **No model serves under a mismatched artifact.**
+
+4. **Feature schema artifact** persisted alongside the model
+   (`app/ml/artifacts/feature_schema.json`). Captures
+   `feature_engineering_version`, `feature_columns`, `n_features_in`,
+   categorical input columns, training prevalence, calibration method, and
+   the decision threshold. Used by integration tests and ops to verify
+   deployment consistency without unpickling.
+
+5. **Pre-existing single-row inference fragility fixed.**
+   `_prepare_categorical_input` now uses the `__missing__` sentinel
+   consistently (matching the joint encoder) instead of `np.nan`, so a
+   single-row predict with a null categorical no longer crashes sklearn's
+   `TargetEncoder` (which fails `np.isnan` on object-dtype categories when
+   training had no nulls for that column). The `missing_*` flag features
+   still carry the missingness signal explicitly to the model.
+
+6. **12 train/serve consistency tests** (`tests/test_feature_engineering.py`)
+   exercise version-mismatch refusal, transform determinism, unseen-vs-missing
+   orthogonality, out-of-vocabulary determinism (two unseen payers produce
+   the same smoothing-prior encoded value), and a target-leakage probe (the
+   deployment encoder cannot leak a row's own label).
+
+**Benefit gained:** Denial dollar attribution is correct. Inference under
+nullable categoricals is deterministic. Train/serve schema drift now hard-
+fails at load time instead of silently corrupting predictions. Unseen and
+zero-denial categories — previously indistinguishable to the model — are
+now separate signals. Retrained on 125,988 labelled claims.
+
+**Pros:** Production correctness restored on a parser-level bug that was
+silently corrupting denial analytics; hard contracts prevent the highest-
+risk class of silent model failure (artifact/code drift); 31 automated tests
+cover the previously-untested parsing and FE surfaces.
+**Cons:** Feature count grew (+4 columns) and `n_features_in_` will
+permanently differ from v3.x — *no compatibility path back to v3.x without
+a code rollback*. The CAS parser still has a documented ambiguity at
+6-element segments that could be either 2 spec triplets-with-quantity or 3
+compact triplets; spec wins by default (see `_parse_cas_triplets` docstring).
+
+**Metrics (test, held-out from 125,988):**
+| Recall | Precision | F1 | Accuracy | ROC-AUC | PR-AUC | Brier (cal) | Threshold |
+|---|---|---|---|---|---|---|---|
+| 0.820 | 0.871 | 0.845 | 0.947 | 0.968 | 0.920 | 0.038 | 0.3333 |
+
+Threshold landed at 0.3333 (precision-floor=0.85 strategy) — within
+~1% of v3.2's 0.3246, confirming the precision-floor rule's stability
+across the v3.3 feature/dataset changes.
+
+**Addendum (2026-05-28, no version bump) — notification surfaces wired:**
+The four v4 unseen-* features were only shifting the model's predictions;
+they weren't surfaced to users or ops. Three surfaces now make that signal
+visible:
+1. **Per-claim**: `PredictionResponse.unseen_indicators` (`payer`/`cpt`/`dx`/`any`)
+   exposed by `/api/predictions/predict` and `/predict-claim`;
+   `ClaimPrediction.unseen_any` exposed by `/predict-file`. The
+   `ClaimDetailPage` renders an amber banner when any dimension is unseen.
+2. **Contribution text**: `FEATURE_DISPLAY_NAMES` and `ML_FEATURE_HINTS`
+   gained entries for the four flags ("New Payer (no training history)" with
+   a biller-meaningful hint), so `top_risk_factors` and the recommendation
+   engine produce readable copy when the flags drive a score.
+3. **Aggregate**: new `GET /api/monitoring/unseen-rate?days=N&top_n=M`
+   endpoint computes the OOV rate from `prediction_log.feature_snapshot`
+   against the deployed engineer's `category_vocabularies_`. A new
+   `UnseenRateCard` on the Monitoring page surfaces overall rate +
+   per-dimension counts + top-N unseen values. Verified end-to-end with a
+   synthetic OOV claim (all three dims flagged true and aggregated in the
+   1-day window).
+
+---
+
 ## v3.2 — Precision-floor balanced threshold
 
-**Date:** 2026-05-27 · **Status:** deployed (current)
+**Date:** 2026-05-27 · **Status:** superseded by v3.3
 
 **Changes from v3.1:**
 1. Threshold strategy F2 → **precision-floor** (`THRESHOLD_STRATEGY="precision_floor"`,

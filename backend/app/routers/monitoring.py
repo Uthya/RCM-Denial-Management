@@ -15,6 +15,7 @@ degrade core RCM functionality.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -93,6 +94,122 @@ async def live_performance(
             "recall": recall,
             "accuracy": accuracy,
             "f1": round(f1, 4),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# /unseen-rate
+# ---------------------------------------------------------------------------
+
+_UNSEEN_DIMENSIONS: dict[str, str] = {
+    "payer": "payer_name",
+    "cpt": "primary_procedure_code",
+    "dx": "primary_diagnosis_code",
+}
+
+
+@router.get("/unseen-rate")
+async def unseen_rate(
+    days: int = Query(7, ge=1, le=365),
+    model_version: str | None = Query(default=None),
+    top_n: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Out-of-vocabulary (OOV) rate over a window of predictions.
+
+    For each prediction in the window we check the raw payer / CPT / Dx
+    captured in ``feature_snapshot`` against the deployed engineer's
+    training-time vocabulary (``category_vocabularies_``). The response
+    reports total / unseen counts per dimension and the top-N unseen values.
+
+    This is the most interpretable "new data arriving" signal in the system:
+    when the unseen rate spikes, the model is being asked to score claims it
+    has no historical baseline for. Treat the risk score as low-confidence
+    until those claims accumulate reconciled outcomes for the next retrain.
+
+    Parameters
+    ----------
+    days : int
+        Rolling window size (1..365).
+    model_version : str, optional
+        Filter to a single deployed version. Without it, the result mixes
+        any predictions tagged with different versions in the window.
+    top_n : int
+        How many top unseen values to return per dimension (1..50).
+    """
+    # Late import — avoid a module-level cycle with the ML package, and let
+    # tests of monitoring run without importing the heavy ML stack.
+    from app.ml.predictor import get_predictor
+
+    predictor = get_predictor()
+    if not predictor.is_ready or predictor.engineer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Predictor not loaded; train/deploy a model before querying unseen-rate.",
+        )
+    vocab = predictor.engineer.category_vocabularies_
+    if vocab is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Deployed engineer has no category vocabulary (artifact predates "
+                "feature engineering v4). Retrain to enable unseen-rate."
+            ),
+        )
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    stmt = select(PredictionLog.feature_snapshot).where(
+        PredictionLog.prediction_time >= since
+    )
+    if model_version:
+        stmt = stmt.where(PredictionLog.model_version == model_version)
+
+    snapshots = (await db.execute(stmt)).scalars().all()
+    total = len(snapshots)
+
+    counters: dict[str, Counter] = {k: Counter() for k in _UNSEEN_DIMENSIONS}
+    dim_unseen: dict[str, int] = {k: 0 for k in _UNSEEN_DIMENSIONS}
+    any_unseen = 0
+
+    for snap in snapshots:
+        if not snap:
+            continue
+        row_has_unseen = False
+        for dim, src_col in _UNSEEN_DIMENSIONS.items():
+            raw = snap.get(src_col)
+            if raw is None or raw == "":
+                continue  # missing — not unseen
+            sval = str(raw)
+            # Mirror the engineer's stringification of null markers — those
+            # are "missing", not "unseen".
+            if sval in ("nan", "None"):
+                continue
+            if sval not in vocab.get(src_col, frozenset()):
+                counters[dim][sval] += 1
+                dim_unseen[dim] += 1
+                row_has_unseen = True
+        if row_has_unseen:
+            any_unseen += 1
+
+    return {
+        "window_days": days,
+        "since": since.isoformat(),
+        "model_version_filter": model_version,
+        "total_predictions": total,
+        "any_unseen": any_unseen,
+        "any_unseen_rate": _safe_div(any_unseen, total),
+        "dimensions": {
+            dim: {
+                "source_column": _UNSEEN_DIMENSIONS[dim],
+                "unseen_count": dim_unseen[dim],
+                "unseen_rate": _safe_div(dim_unseen[dim], total),
+                "top_unseen_values": [
+                    {"value": v, "count": c}
+                    for v, c in counters[dim].most_common(top_n)
+                ],
+            }
+            for dim in _UNSEEN_DIMENSIONS
         },
     }
 

@@ -18,6 +18,9 @@ class Adjustment(TimestampMixin, Base):
         String(10), nullable=False, index=True
     )
     adjustment_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # CAS triplet position 3 (CAS04, CAS07, ...) — optional per X12 005010.
+    # Captures the unit/quantity adjustment when present; many 835s omit it.
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 3), nullable=True)
     raw_cas_segment: Mapped[str | None] = mapped_column(Text)
 
     remittance_claim: Mapped["RemittanceClaim"] = relationship(

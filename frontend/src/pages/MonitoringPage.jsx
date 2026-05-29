@@ -3,11 +3,13 @@ import {
   getLivePerformance,
   getDriftReport,
   getPredictionLog,
+  getUnseenRate,
 } from '../services/api';
 import LivePerformanceCard from '../components/monitoring/LivePerformanceCard';
 import DriftSummary from '../components/monitoring/DriftSummary';
 import PredictionLogTable from '../components/monitoring/PredictionLogTable';
 import PredictionDetailModal from '../components/monitoring/PredictionDetailModal';
+import UnseenRateCard from '../components/monitoring/UnseenRateCard';
 
 const PAGE_SIZE = 25;
 
@@ -57,6 +59,27 @@ export default function MonitoringPage() {
     loadDrift();
   }, [loadDrift]);
 
+  // --- Unseen / OOV rate (uses the drift window) ---
+  const [unseenData, setUnseenData] = useState(null);
+  const [unseenLoading, setUnseenLoading] = useState(false);
+  const [unseenError, setUnseenError] = useState(null);
+
+  const loadUnseen = useCallback(() => {
+    setUnseenLoading(true);
+    setUnseenError(null);
+    getUnseenRate({ days: driftDays })
+      .then((res) => setUnseenData(res.data))
+      .catch((err) => {
+        setUnseenData(null);
+        setUnseenError(errorMessage(err));
+      })
+      .finally(() => setUnseenLoading(false));
+  }, [driftDays]);
+
+  useEffect(() => {
+    loadUnseen();
+  }, [loadUnseen]);
+
   // --- Prediction log ---
   const [logRows, setLogRows] = useState([]);
   const [logTotal, setLogTotal] = useState(0);
@@ -104,6 +127,7 @@ export default function MonitoringPage() {
   function refreshAll() {
     loadPerf();
     loadDrift();
+    loadUnseen();
     loadLog();
   }
 
@@ -165,6 +189,14 @@ export default function MonitoringPage() {
         loading={driftLoading}
         error={driftError}
         onRefresh={loadDrift}
+        days={driftDays}
+      />
+
+      <UnseenRateCard
+        data={unseenData}
+        loading={unseenLoading}
+        error={unseenError}
+        onRefresh={loadUnseen}
         days={driftDays}
       />
 

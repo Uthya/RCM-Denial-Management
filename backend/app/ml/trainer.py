@@ -46,7 +46,11 @@ from app.ml.distributions import (
     build_distribution_snapshot,
     save_distribution_snapshot,
 )
-from app.ml.feature_engineering import FEATURE_COLUMNS, FeatureEngineer
+from app.ml.feature_engineering import (
+    FEATURE_COLUMNS,
+    FEATURE_ENGINEERING_VERSION,
+    FeatureEngineer,
+)
 from app.models.training_metric import TrainingMetric
 
 # v2 -> v3: calibrated probabilities + tuned decision threshold (not 0.5).
@@ -54,9 +58,16 @@ from app.models.training_metric import TrainingMetric
 # v3.1 -> v3.2: F2 (~0.19) was too aggressive in production (precision collapsed
 # under the train/live prevalence gap). v3.2 uses a precision-floor threshold
 # (~0.30) — the balanced operating point validated on the internal test set,
-# live reconciled data, AND a 50k external eval. Bumping the version keeps each
-# scoring regime separate in the monitoring layer.
-MODEL_VERSION = "v3.2"
+# live reconciled data, AND a 50k external eval.
+# v3.2 -> v3.3: feature engineering bumped to v4 (explicit unseen-category
+# indicators), CAS parser fixed (denial dollars now align with CARC codes),
+# strict-fail artifact loading (version/column mismatches refuse to serve),
+# feature schema artifact persisted for train/serve consistency checks.
+# v3.3 -> v3.4: LOW risk bucket detached from threshold and tightened to a
+# fixed <5% calibrated probability (test-set LOW denial rate drops 1.7% -> 0.8%);
+# calibration CV folds bumped 3 -> 5 for finer-grained OOF probability
+# estimation in the low-score region.
+MODEL_VERSION = "v3.4"
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +80,13 @@ TUNE_BY_DEFAULT = True
 DEFAULT_N_TRIALS = 30
 TUNING_TIMEOUT_SECONDS = 180
 MAX_CV_FOLDS = 5
+
+# Early-stopping: abort the Optuna study when the best PR-AUC fails to
+# improve by at least EPSILON over PATIENCE consecutive trials. Empirically
+# the TPE sampler on this data converges in the first 5-10 trials, so we
+# cap wasted compute beyond that.
+TUNING_EARLY_STOP_PATIENCE = 5
+TUNING_EARLY_STOP_EPSILON = 1e-3
 # PR-AUC (average precision) is the search OBJECTIVE — imbalance-aware, unlike
 # ROC-AUC. It rewards the search for ranking the minority (denied) class well.
 # NOTE: ROC-AUC is still computed and reported in metrics; only the metric the
@@ -83,7 +101,11 @@ SPW_SEARCH_HI = 3.0
 
 # Out-of-fold calibration + threshold selection settings.
 CALIBRATION_METHOD = "isotonic"
-CALIBRATION_CV_FOLDS = 3
+# v3.4: bumped 3 -> 5. More folds = finer-grained OOF probability estimation,
+# especially in the low-score region where most claims live (large bins of
+# similar predicted prob). Marginal accuracy gain on test Brier; meaningful
+# robustness in the LOW band the new bucket cutoff cares about.
+CALIBRATION_CV_FOLDS = 5
 # Decision-threshold selection on out-of-fold calibrated probabilities.
 #   "precision_floor" — highest-recall threshold with precision >= PRECISION_FLOOR.
 #                       Catches as many denials as possible within a false-alarm
@@ -96,6 +118,147 @@ DEFAULT_THRESHOLD = 0.5
 
 # Quiet Optuna's per-trial chatter; we log our own summary instead.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+# Per-stage timing — emitted in metrics artifact + API response so an operator
+# can see where time goes without instrumenting locally.
+class _StageTimer:
+    """Lightweight per-stage timing accumulator. Use as a context manager."""
+
+    def __init__(self) -> None:
+        self.stages: dict[str, float] = {}
+        self._start: float | None = None
+        self._stage: str | None = None
+
+    def __call__(self, stage: str) -> "_StageTimer":
+        self._stage = stage
+        return self
+
+    def __enter__(self) -> "_StageTimer":
+        self._start = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._start is not None and self._stage is not None:
+            self.stages[self._stage] = round(time.time() - self._start, 3)
+            self._start = None
+            self._stage = None
+
+
+def _check_quality_regression(new_metrics: dict, prior_metrics: dict | None) -> dict:
+    """Compare new metrics against the most recent compatible prior training.
+
+    Returns a structured report:
+      - status: "ok" | "warn" | "skipped"
+      - regressions: list of {metric, prior, new, delta, threshold}
+    Warns (but does NOT block) — operator decides whether to accept.
+    """
+    if not prior_metrics:
+        return {"status": "skipped", "reason": "no prior metrics to compare"}
+    # Threshold = positive number; metric is "regressed" if it DROPPED by >= threshold
+    # (for "lower is better" metrics like Brier, regression = ROSE by threshold).
+    LOWER_IS_BETTER = {"brier_calibrated", "brier_uncalibrated"}
+    THRESHOLDS = {
+        "pr_auc": 0.01,
+        "roc_auc": 0.01,
+        "recall": 0.02,
+        "precision": 0.02,
+        "f1": 0.015,
+        "brier_calibrated": 0.005,
+    }
+    regressions = []
+    for key, thr in THRESHOLDS.items():
+        prior = prior_metrics.get(key)
+        new = new_metrics.get(key)
+        if prior is None or new is None:
+            continue
+        if key in LOWER_IS_BETTER:
+            delta = float(new) - float(prior)  # positive = worse
+            if delta > thr:
+                regressions.append({"metric": key, "prior": prior, "new": new, "delta": round(delta, 5), "threshold": thr})
+        else:
+            delta = float(prior) - float(new)  # positive = worse
+            if delta > thr:
+                regressions.append({"metric": key, "prior": prior, "new": new, "delta": round(delta, 5), "threshold": thr})
+    if regressions:
+        for r in regressions:
+            logger.warning(
+                "Quality regression on %s: prior=%.4f new=%.4f delta=%.4f (threshold %.4f)",
+                r["metric"], r["prior"], r["new"], r["delta"], r["threshold"],
+            )
+        return {"status": "warn", "regressions": regressions}
+    return {"status": "ok", "regressions": []}
+
+
+# Retrain modes.
+MODE_FULL = "full"    # Optuna search + adaptive trial budget + calibration. Use after FE changes, drift, scheduled retrains.
+MODE_WARM = "warm"    # Reuse last good hyperparameters; skip Optuna; full calibration. Routine retrains.
+MODE_QUICK = "quick"  # Same as warm but with 3-fold calibration. Fastest; for development/iteration.
+MODES = (MODE_FULL, MODE_WARM, MODE_QUICK)
+
+
+def _load_last_known_hyperparameters() -> dict | None:
+    """Load the most recent training run's best hyperparameters + version tags.
+
+    Used by warm/quick retrain modes to skip Optuna. Reads
+    ``training_metrics.json`` rather than the DB so it works in isolated
+    runtime environments. Returns ``None`` if the artifact is absent or its
+    version tags don't match the deployed code (warm-mode would be unsafe
+    against a different feature pipeline).
+    """
+    import os as _os
+    if not _os.path.exists(settings.ML_METRICS_PATH):
+        return None
+    try:
+        with open(settings.ML_METRICS_PATH, encoding="utf-8") as f:
+            artifact = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logger.exception("Could not read training_metrics.json for warm retrain")
+        return None
+    hp = artifact.get("hyperparameters")
+    if not hp:
+        return None
+    # Inspect the schema artifact to verify the FE/model version match.
+    schema_path = Path(settings.ML_FEATURE_SCHEMA_PATH)
+    if schema_path.exists():
+        try:
+            schema = json.loads(schema_path.read_text())
+            if schema.get("model_version") != MODEL_VERSION:
+                logger.warning(
+                    "Warm retrain skipped: schema model_version=%s, current=%s",
+                    schema.get("model_version"),
+                    MODEL_VERSION,
+                )
+                return None
+            from app.ml.feature_engineering import FEATURE_ENGINEERING_VERSION
+            if schema.get("feature_engineering_version") != FEATURE_ENGINEERING_VERSION:
+                logger.warning(
+                    "Warm retrain skipped: schema FE version=%s, current=%s",
+                    schema.get("feature_engineering_version"),
+                    FEATURE_ENGINEERING_VERSION,
+                )
+                return None
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Could not read feature_schema.json for warm retrain")
+            return None
+    return hp
+
+
+def _adaptive_n_trials(n_samples: int) -> int:
+    """Dataset-size-aware default trial budget.
+
+    Optuna's TPE sampler shows steep diminishing returns past ~5–10 trials on
+    this codebase's data, but the marginal value of each trial drops faster
+    on small datasets where CV-fold noise dominates. These bands match
+    empirical observations on the 200-claim, 35k-claim, and 177k-claim runs.
+    """
+    if n_samples < 500:
+        return 5
+    if n_samples < 5_000:
+        return 10
+    if n_samples < 50_000:
+        return 20
+    return DEFAULT_N_TRIALS
 
 
 def _default_hyperparameters(scale_pos_weight: float) -> dict:
@@ -171,6 +334,38 @@ def _tune_hyperparameters(
 
     cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
 
+    # ------------------------------------------------------------------
+    # Pre-engineer the CV folds ONCE before the Optuna loop.
+    #
+    # Why: the fold splits are deterministic (seeded), so every trial sees
+    # the same train/val indices and would otherwise refit FeatureEngineer
+    # 5x per trial — that's ~80% of tuning time on large datasets.
+    #
+    # Leakage safety: each fold's engineer is fit on that fold's TRAIN
+    # rows only (FE.fit_transform); the val matrix comes from
+    # FE.transform (deployment-mapping, no target leakage). The cache is
+    # used only within its own fold, so cross-fold target statistics
+    # never reach val rows. Same isolation as the previous
+    # cross_val_score(Pipeline(FE, XGB)).
+    # ------------------------------------------------------------------
+    fe_start = time.time()
+    fold_cache: list[tuple] = []  # (X_train_fold, y_train_fold, X_val_fold, y_val_fold)
+    for tr_idx, val_idx in cv.split(df_train, y_train):
+        df_fold_tr = df_train.iloc[tr_idx]
+        df_fold_val = df_train.iloc[val_idx]
+        y_fold_tr = y_train.iloc[tr_idx]
+        y_fold_val = y_train.iloc[val_idx]
+        fe_fold = FeatureEngineer()
+        X_fold_tr = fe_fold.fit_transform(df_fold_tr, y_fold_tr)
+        X_fold_val = fe_fold.transform(df_fold_val)
+        fold_cache.append((X_fold_tr, y_fold_tr, X_fold_val, y_fold_val))
+    fe_cache_time = round(time.time() - fe_start, 3)
+    logger.info(
+        "Pre-engineered %d CV folds for tuning in %.1fs (cache reused across all trials)",
+        n_folds,
+        fe_cache_time,
+    )
+
     def objective(trial: optuna.Trial) -> float:
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 50, 400, step=25),
@@ -184,43 +379,65 @@ def _tune_hyperparameters(
             "gamma": trial.suggest_float("gamma", 0.0, 5.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-            # Step 3: tune the class-imbalance weight around the natural ratio
-            # instead of fixing it. Calibration (downstream) restores honest
-            # probabilities after whatever weight the search prefers.
             "scale_pos_weight": trial.suggest_float(
                 "scale_pos_weight",
                 scale_pos_weight * SPW_SEARCH_LO,
                 scale_pos_weight * SPW_SEARCH_HI,
             ),
         }
-        # Feature engineering lives INSIDE the pipeline so cross_val_score
-        # refits the encoders on each fold's training rows only — no leakage
-        # from the held-out fold into its own encoded features.
-        pipeline = Pipeline(
-            [
-                ("features", FeatureEngineer()),
-                (
-                    "model",
-                    XGBClassifier(
-                        **params,
-                        random_state=RANDOM_STATE,
-                        eval_metric="logloss",
-                        n_jobs=-1,
-                    ),
-                ),
-            ]
-        )
-        scores = cross_val_score(
-            pipeline, df_train, y_train, cv=cv, scoring=TUNING_METRIC, n_jobs=1
-        )
-        return float(scores.mean())
+        # Fit XGBoost ONLY on the pre-engineered fold matrices. The FE
+        # work was already done above; we're now just scanning the
+        # hyperparameter space against fixed feature matrices.
+        scores: list[float] = []
+        for X_fold_tr, y_fold_tr, X_fold_val, y_fold_val in fold_cache:
+            model = XGBClassifier(
+                **params,
+                random_state=RANDOM_STATE,
+                eval_metric="logloss",
+                n_jobs=-1,
+            )
+            model.fit(X_fold_tr, y_fold_tr)
+            proba = model.predict_proba(X_fold_val)[:, 1]
+            if TUNING_METRIC == "average_precision":
+                scores.append(float(average_precision_score(y_fold_val, proba)))
+            else:
+                scores.append(float(roc_auc_score(y_fold_val, proba)))
+        return float(np.mean(scores))
+
+    # ------------------------------------------------------------------
+    # Early-stop callback: abort the study after N consecutive trials
+    # with no meaningful improvement in the best PR-AUC. Saves
+    # wall-clock time when TPE has converged.
+    # ------------------------------------------------------------------
+    def _early_stop(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        """Stop the study if the best PR-AUC has not improved by at least
+        EPSILON over the last PATIENCE trials. Correctly compares the
+        best-so-far against the best as-of (PATIENCE) trials ago.
+        """
+        completed = [t.value for t in study.trials if t.value is not None]
+        if len(completed) <= TUNING_EARLY_STOP_PATIENCE:
+            return  # not enough trials to evaluate patience window
+        best_now = max(completed)
+        best_before_window = max(completed[: -TUNING_EARLY_STOP_PATIENCE])
+        if best_now - best_before_window < TUNING_EARLY_STOP_EPSILON:
+            logger.info(
+                "Optuna early-stop: best improved by only %.4f over last %d "
+                "trials (current best %.4f after %d trials)",
+                best_now - best_before_window,
+                TUNING_EARLY_STOP_PATIENCE,
+                study.best_value,
+                len(completed),
+            )
+            study.stop()
 
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
     )
     start = time.time()
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    study.optimize(
+        objective, n_trials=n_trials, timeout=timeout, callbacks=[_early_stop]
+    )
     elapsed = round(time.time() - start, 3)
 
     best = study.best_params
@@ -239,6 +456,9 @@ def _tune_hyperparameters(
         "random_state": RANDOM_STATE,
         "eval_metric": "logloss",
     }
+    early_stopped = len(study.trials) < n_trials and (
+        timeout is None or elapsed < (timeout - 1)
+    )
     tuning = {
         "enabled": True,
         "metric": TUNING_METRIC,
@@ -250,6 +470,8 @@ def _tune_hyperparameters(
         "cv_folds": n_folds,
         "timeout_seconds": timeout,
         "tuning_time_seconds": elapsed,
+        "fold_cache_seconds": fe_cache_time,
+        "early_stopped": bool(early_stopped),
         "best_params": best,
     }
     return {"hyperparameters": params, "tuning": tuning}
@@ -321,6 +543,7 @@ def _fit_calibrator_and_threshold(
     df_train: pd.DataFrame,
     y_train: pd.Series,
     hyperparameters: dict,
+    cv_folds: int | None = None,
 ) -> dict:
     """Fit an isotonic calibrator + decision threshold, leakage-free.
 
@@ -335,7 +558,8 @@ def _fit_calibrator_and_threshold(
     probabilities in a non-sigmoidal way that only a non-parametric monotonic
     fit corrects well.
     """
-    n_folds = max(2, min(CALIBRATION_CV_FOLDS, int(min(y_train.sum(), len(y_train) - y_train.sum()))))
+    target_folds = cv_folds if cv_folds is not None else CALIBRATION_CV_FOLDS
+    n_folds = max(2, min(target_folds, int(min(y_train.sum(), len(y_train) - y_train.sum()))))
     cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
 
     pipeline = _build_pipeline(hyperparameters)
@@ -380,8 +604,9 @@ def _fit_calibrator_and_threshold(
 def _run_training(
     df: pd.DataFrame,
     tune: bool = TUNE_BY_DEFAULT,
-    n_trials: int = DEFAULT_N_TRIALS,
+    n_trials: int | None = None,
     tuning_timeout: int | None = TUNING_TIMEOUT_SECONDS,
+    mode: str = MODE_FULL,
 ) -> dict:
     """Train an XGBClassifier and return results with metrics.
 
@@ -390,12 +615,23 @@ def _run_training(
     df : pd.DataFrame
         Raw labelled DataFrame from ``build_dataset()``.
     tune : bool
-        When ``True``, search hyperparameters with Optuna (cross-validated on
-        the training split). When ``False``, use the fixed baseline params.
-    n_trials : int
-        Maximum Optuna trials when ``tune`` is enabled.
+        When ``True``, search hyperparameters with Optuna. When ``False``,
+        use the fixed baseline params. Ignored when ``mode`` selects warm or
+        quick (those always skip tuning).
+    n_trials : int | None
+        Maximum Optuna trials. ``None`` (default) picks an adaptive budget
+        based on ``len(df)``; an explicit value overrides.
     tuning_timeout : int | None
         Wall-clock budget for tuning in seconds (``None`` for no limit).
+    mode : str
+        One of ``"full"``, ``"warm"``, ``"quick"``:
+        - ``full`` (default): Optuna search + isotonic calibration. Use when
+          features change, on schedule, or on first run.
+        - ``warm``: reuse last run's best hyperparameters from the saved
+          metrics artifact (must match current MODEL_VERSION + FEATURE_VERSION);
+          skip Optuna entirely. Routine retrains.
+        - ``quick``: same as warm but with reduced (3-fold) calibration. For
+          dev/iteration where speed > calibration precision.
 
     Returns
     -------
@@ -407,6 +643,8 @@ def _run_training(
     ValueError
         If ``df`` has fewer than ``MIN_TRAINING_SAMPLES`` rows.
     """
+    if mode not in MODES:
+        raise ValueError(f"Unknown mode {mode!r}; expected one of {MODES}")
     if len(df) < MIN_TRAINING_SAMPLES:
         raise ValueError(
             f"Need at least {MIN_TRAINING_SAMPLES} labelled samples for training, "
@@ -414,6 +652,15 @@ def _run_training(
         )
 
     start_time = time.time()
+    stage_timer = _StageTimer()
+
+    # Capture previous metrics for regression check (best-effort).
+    prior_metrics: dict | None = None
+    try:
+        if Path(settings.ML_METRICS_PATH).exists():
+            prior_metrics = json.loads(Path(settings.ML_METRICS_PATH).read_text()).get("metrics")
+    except Exception:
+        prior_metrics = None
 
     # Log class distribution
     stats = get_dataset_stats(df)
@@ -441,38 +688,80 @@ def _run_training(
         df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=stratify
     )
 
-    # Hyperparameters — tuned with Optuna (leakage-free CV on df_train) or the
-    # fixed baseline. ``scale_pos_weight`` is always carried through so the
-    # final model accounts for class imbalance regardless of tuning.
-    if tune:
-        logger.info(
-            "Tuning hyperparameters with Optuna (n_trials=%d, timeout=%ss)",
-            n_trials,
-            tuning_timeout,
-        )
-        tune_result = _tune_hyperparameters(
-            df_train, y_train, scale_pos_weight, n_trials, tuning_timeout
-        )
-        hyperparameters = tune_result["hyperparameters"]
-        tuning_info = tune_result["tuning"]
-    else:
-        hyperparameters = _default_hyperparameters(scale_pos_weight)
-        tuning_info = {"enabled": False}
+    # Hyperparameters — resolved by mode:
+    # - warm/quick: reuse last run's best params from the saved artifact (skip
+    #   Optuna entirely).
+    # - full + tune=True: run Optuna with an adaptive trial budget.
+    # - full + tune=False: fixed baseline params (rarely useful).
+    reused_from_artifact = False
+    if mode in (MODE_WARM, MODE_QUICK):
+        prior = _load_last_known_hyperparameters()
+        if prior is None:
+            logger.warning(
+                "mode=%s requested but no compatible prior artifact found; "
+                "falling back to mode=full",
+                mode,
+            )
+            mode = MODE_FULL
+        else:
+            hyperparameters = prior
+            reused_from_artifact = True
+            tuning_info = {
+                "enabled": False,
+                "mode": mode,
+                "reused_from": "training_metrics.json",
+                "n_trials_completed": 0,
+            }
+            logger.info(
+                "mode=%s: reusing prior best hyperparameters (skipping Optuna)",
+                mode,
+            )
+
+    if mode == MODE_FULL:
+        if tune:
+            if n_trials is None:
+                n_trials = _adaptive_n_trials(len(df_train))
+                logger.info(
+                    "Adaptive trial budget: %d trials for %d training rows",
+                    n_trials,
+                    len(df_train),
+                )
+            logger.info(
+                "Tuning hyperparameters with Optuna (n_trials=%d, timeout=%ss)",
+                n_trials,
+                tuning_timeout,
+            )
+            with stage_timer("tuning"):
+                tune_result = _tune_hyperparameters(
+                    df_train, y_train, scale_pos_weight, n_trials, tuning_timeout
+                )
+            hyperparameters = tune_result["hyperparameters"]
+            tuning_info = tune_result["tuning"]
+            tuning_info["mode"] = mode
+        else:
+            hyperparameters = _default_hyperparameters(scale_pos_weight)
+            tuning_info = {"enabled": False, "mode": mode}
 
     # --- Deployed model: fit on the TRAIN split ----------------------------
     # The engineer + model are fit on df_train only; df_test stays untouched
     # for honest evaluation below. We deploy this train-split model (reserving
     # 20% for unbiased metrics) rather than refitting on everything, so the
     # calibrator below matches the exact model that produced its OOF scores.
-    engineer = FeatureEngineer()
-    X_train = engineer.fit_transform(df_train, y_train)
-    model = XGBClassifier(n_jobs=-1, **hyperparameters)
-    model.fit(X_train, y_train)
+    with stage_timer("deploy_fit"):
+        engineer = FeatureEngineer()
+        X_train = engineer.fit_transform(df_train, y_train)
+        model = XGBClassifier(n_jobs=-1, **hyperparameters)
+        model.fit(X_train, y_train)
 
     # --- Calibration + decision threshold (Step 1 + calibration) -----------
     # Leakage-free: isotonic calibrator and F1-optimal threshold are derived
     # from out-of-fold predictions over df_train (df_test is never involved).
-    cal_result = _fit_calibrator_and_threshold(df_train, y_train, hyperparameters)
+    # Quick mode uses 3-fold calibration for an extra speed bump.
+    cal_cv_override = 3 if mode == MODE_QUICK else None
+    with stage_timer("calibration"):
+        cal_result = _fit_calibrator_and_threshold(
+            df_train, y_train, hyperparameters, cv_folds=cal_cv_override
+        )
     calibrator = cal_result["calibrator"]
     threshold = cal_result["threshold"]
     calibration_info = cal_result["info"]
@@ -562,6 +851,34 @@ def _run_training(
     )
     logger.info("Saved calibrator + threshold to %s", calibrator_path)
 
+    # Persist a human-readable schema describing the feature contract this
+    # model was trained against. The predictor loads (model, engineer,
+    # calibrator) and validates against this schema at deployment; tests use
+    # it to assert train/serve consistency without unpickling artifacts.
+    schema_path = Path(settings.ML_FEATURE_SCHEMA_PATH)
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_artifact = {
+        "model_version": MODEL_VERSION,
+        "feature_engineering_version": FEATURE_ENGINEERING_VERSION,
+        "feature_columns": list(FEATURE_COLUMNS),
+        "n_features_in": len(FEATURE_COLUMNS),
+        "categorical_columns": [
+            "payer_name",
+            "frequency_code",
+            "facility_type_code",
+            "primary_procedure_code",
+            "primary_diagnosis_code",
+            "place_of_service",
+        ],
+        "training_prevalence": round(float(y.mean()), 6),
+        "training_size": int(len(y)),
+        "calibration_method": CALIBRATION_METHOD,
+        "decision_threshold": round(float(threshold), 6),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+    }
+    schema_path.write_text(json.dumps(schema_artifact, indent=2))
+    logger.info("Saved feature schema to %s", schema_path)
+
     trained_at = datetime.now(timezone.utc).isoformat()
     training_time = round(time.time() - start_time, 3)
 
@@ -599,8 +916,11 @@ def _run_training(
     except Exception:
         logger.exception("Failed to write training distribution snapshot")
 
+    quality_check = _check_quality_regression(metrics, prior_metrics)
+
     return {
         "status": "success",
+        "mode": mode,
         "trained_at": trained_at,
         "training_time_seconds": training_time,
         "dataset_stats": stats,
@@ -626,14 +946,17 @@ def _run_training(
         "hyperparameters": hyperparameters,
         "tuning": tuning_info,
         "calibration": calibration_info,
+        "quality_check": quality_check,
+        "stage_timings_seconds": stage_timer.stages,
     }
 
 
 async def train_model(
     db: AsyncSession,
     tune: bool = TUNE_BY_DEFAULT,
-    n_trials: int = DEFAULT_N_TRIALS,
+    n_trials: int | None = None,
     tuning_timeout: int | None = TUNING_TIMEOUT_SECONDS,
+    mode: str = MODE_FULL,
 ) -> dict:
     """Build the dataset from the DB and train an XGBoost model.
 
@@ -642,11 +965,14 @@ async def train_model(
     db : AsyncSession
         Database session for querying claims.
     tune : bool
-        Enable Optuna hyperparameter tuning (default ``True``).
-    n_trials : int
-        Maximum Optuna trials when tuning is enabled.
+        Enable Optuna hyperparameter tuning (full mode only; default True).
+    n_trials : int | None
+        Maximum Optuna trials. ``None`` → adaptive (5/10/20/30 by dataset size).
     tuning_timeout : int | None
-        Wall-clock budget for tuning in seconds (``None`` for no limit).
+        Wall-clock budget for tuning in seconds (``None`` = no limit).
+    mode : str
+        ``"full"`` (default), ``"warm"`` (reuse last hyperparams, skip Optuna),
+        or ``"quick"`` (warm + reduced calibration folds).
 
     Returns
     -------
@@ -663,7 +989,7 @@ async def train_model(
     # thread so it doesn't block the event loop for the tuning budget. The DB
     # session is untouched inside _run_training, so this is safe.
     result = await asyncio.to_thread(
-        _run_training, df, tune, n_trials, tuning_timeout
+        _run_training, df, tune, n_trials, tuning_timeout, mode
     )
     training_id = await _persist_training_metrics(db, result)
     result["training_id"] = training_id
@@ -742,12 +1068,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train the denial-prediction model")
     parser.add_argument(
-        "--no-tune",
-        action="store_true",
-        help="Skip Optuna tuning and use baseline hyperparameters",
+        "--mode",
+        choices=list(MODES),
+        default=MODE_FULL,
+        help="Retrain mode: full (Optuna search), warm (reuse prior params), quick (warm + 3-fold calibration)",
     )
     parser.add_argument(
-        "--n-trials", type=int, default=DEFAULT_N_TRIALS, help="Max Optuna trials"
+        "--no-tune",
+        action="store_true",
+        help="Skip Optuna tuning and use baseline hyperparameters (full mode only)",
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        help="Max Optuna trials (default: adaptive by dataset size)",
     )
     parser.add_argument(
         "--timeout",
@@ -764,6 +1099,7 @@ if __name__ == "__main__":
                 tune=not args.no_tune,
                 n_trials=args.n_trials,
                 tuning_timeout=args.timeout,
+                mode=args.mode,
             )
             print(json.dumps(results, indent=2))
 

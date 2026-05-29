@@ -59,14 +59,30 @@ FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "dx_volume": "Diagnosis Claim Volume",
     "is_rare_payer": "Rare Payer",
     "is_rare_cpt": "Rare Procedure",
+    # v4 unseen-at-training indicators — distinct from "rare" (rare = seen
+    # few times; unseen = never seen at all → no historical baseline).
+    "unseen_payer": "New Payer (no training history)",
+    "unseen_cpt": "New Procedure Code (no training history)",
+    "unseen_dx": "New Diagnosis Code (no training history)",
+    "unseen_any": "New Payer/CPT/Dx Combination",
 }
 
-MODEL_VERSION = "v3.2"
-FEATURE_VERSION = "v3"
+MODEL_VERSION = "v3.4"
+FEATURE_VERSION = "v4"
 
 # Fallback when no calibrator artifact is present (older models): use raw
 # scores and the classic 0.5 cutoff so prediction never hard-fails.
 DEFAULT_THRESHOLD = 0.5
+
+# Risk-level bucket cut-offs operate on the CALIBRATED probability:
+#   HIGH    >= decision threshold (predicted-denied)
+#   MEDIUM  in [LOW_PROB_CUTOFF, threshold)   — borderline / worth reviewing
+#   LOW     < LOW_PROB_CUTOFF                 — calibrated < 5% denial chance
+# v3.4: LOW was previously 0.5 * threshold (~0.17), which made LOW span a band
+# with ~1.7% real-world denial rate on the test set. Tightening LOW to <0.05
+# drops the in-bucket denial rate to ~0.79%, matching the user expectation
+# that "LOW = safe to ignore." MEDIUM widens to ~12% rate (review-worthy).
+LOW_PROB_CUTOFF = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -97,18 +113,28 @@ class DenialPredictor:
             self.model = None
             return False
 
-        # Calibrator + tuned threshold are optional: a model trained before
-        # calibration existed still serves, just with raw scores at 0.5.
+        # Calibrator + tuned threshold are optional only for models trained
+        # before calibration existed. When present, the bundled model_version
+        # MUST match the predictor's MODEL_VERSION — a mismatch means the
+        # calibrator was fit on a different model's score distribution and
+        # would silently emit wrong probabilities.
         self.calibrator = None
         self.threshold = DEFAULT_THRESHOLD
         try:
             if os.path.exists(settings.ML_CALIBRATOR_PATH):
                 bundle = joblib.load(settings.ML_CALIBRATOR_PATH)
+                bundled_version = bundle.get("model_version")
+                if bundled_version and bundled_version != MODEL_VERSION:
+                    raise ValueError(
+                        f"Calibrator model_version mismatch: bundled={bundled_version!r}, "
+                        f"current={MODEL_VERSION!r}. Refusing to serve — retrain to align."
+                    )
                 self.calibrator = bundle.get("calibrator")
                 self.threshold = float(bundle.get("threshold", DEFAULT_THRESHOLD))
                 logger.info(
-                    "Loaded calibrator (method=%s, threshold=%.4f)",
+                    "Loaded calibrator (method=%s, model_version=%s, threshold=%.4f)",
                     bundle.get("method", "unknown"),
+                    bundled_version or "unspecified",
                     self.threshold,
                 )
             else:
@@ -116,6 +142,11 @@ class DenialPredictor:
                     "No calibrator at %s; serving raw scores at 0.5 threshold",
                     settings.ML_CALIBRATOR_PATH,
                 )
+        except ValueError:
+            # Re-raise version-mismatch errors loudly — silent fallback would
+            # mask a deployment bug.
+            self.model = None
+            raise
         except Exception:
             logger.exception("Failed to load calibrator; falling back to raw scores")
             self.calibrator = None
@@ -151,6 +182,17 @@ class DenialPredictor:
         # Transform through the feature pipeline
         features = self.engineer.transform(df)
 
+        # Hard-fail validation: feature count must match what the engineer
+        # was fit with. Silent column drift here would propagate into XGBoost
+        # as a shape error or, worse, a silent miscolumn mapping.
+        expected = self.engineer.n_features_in_
+        if expected is not None and features.shape[1] != expected:
+            raise RuntimeError(
+                f"Feature matrix has {features.shape[1]} columns, "
+                f"engineer expected {expected}. The engineer/model artifact is "
+                "inconsistent — retrain to regenerate."
+            )
+
         # Raw model probability of denial (class 1)
         proba = self.model.predict_proba(features)
         raw_score = float(proba[0, 1])
@@ -176,6 +218,21 @@ class DenialPredictor:
         # change feature attributions), so explainability is unaffected.
         top_risk_factors = self._compute_contributions(features)
 
+        # Unseen-category indicators (v4 features). Surfacing these lets the UI
+        # badge claims whose payer/CPT/Dx wasn't in the training vocabulary —
+        # the user sees "the model has no historical baseline for this value"
+        # instead of mistakenly trusting a low score on an OOV claim. Pulled
+        # directly from the engineered row so the badge state always matches
+        # what the model itself saw.
+        unseen_indicators: dict | None = None
+        if all(c in features.columns for c in ("unseen_payer", "unseen_cpt", "unseen_dx", "unseen_any")):
+            unseen_indicators = {
+                "payer": bool(int(features["unseen_payer"].iloc[0])),
+                "cpt": bool(int(features["unseen_cpt"].iloc[0])),
+                "dx": bool(int(features["unseen_dx"].iloc[0])),
+                "any": bool(int(features["unseen_any"].iloc[0])),
+            }
+
         return {
             "prediction_id": str(uuid.uuid4()),
             "risk_score": round(risk_score, 4),
@@ -184,6 +241,7 @@ class DenialPredictor:
             "decision_threshold": round(self.threshold, 4),
             "risk_level": risk_level,
             "top_risk_factors": top_risk_factors,
+            "unseen_indicators": unseen_indicators,
             "model_version": MODEL_VERSION,
             "feature_version": FEATURE_VERSION,
             "prediction_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -240,18 +298,22 @@ class DenialPredictor:
 # ---------------------------------------------------------------------------
 
 def _classify_risk(score: float, threshold: float = DEFAULT_THRESHOLD) -> str:
-    """Bucket a calibrated probability relative to the decision threshold.
+    """Bucket a calibrated probability into LOW / MEDIUM / HIGH.
 
-    Tying buckets to the threshold (instead of fixed 0.3/0.7 cutoffs designed
-    for the old uncalibrated scores) keeps the label coherent with the binary
-    decision and stops genuinely-deniable claims from hiding in "LOW":
-      - HIGH   : score >= threshold  (i.e. predicted denied)
-      - MEDIUM : half the threshold <= score < threshold (borderline / watch)
-      - LOW    : score < half the threshold (well clear of the decision line)
+    Buckets use a fixed LOW boundary (calibrated probability) so "LOW" carries
+    a consistent operational meaning across model versions, while HIGH stays
+    coupled to the model's tuned decision threshold:
+      - HIGH   : score >= threshold (predicted denied)
+      - MEDIUM : LOW_PROB_CUTOFF <= score < threshold (borderline / review)
+      - LOW    : score < LOW_PROB_CUTOFF (very-low denial probability)
+    v3.4: LOW boundary detached from threshold and set at a fixed 5%. On the
+    test split this drops in-bucket denial rate from ~1.7% to ~0.8% while
+    keeping HIGH semantics ("predicted denied") tied to the deployed
+    threshold.
     """
     if score >= threshold:
         return "HIGH"
-    if score >= 0.5 * threshold:
+    if score >= LOW_PROB_CUTOFF:
         return "MEDIUM"
     return "LOW"
 

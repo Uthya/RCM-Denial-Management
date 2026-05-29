@@ -98,6 +98,15 @@ function DenialRiskCard({ claimId }) {
     hour: 'numeric', minute: '2-digit',
   });
 
+  const unseen = prediction.unseen_indicators;
+  const unseenDims = unseen
+    ? [
+        unseen.payer && 'payer',
+        unseen.cpt && 'procedure',
+        unseen.dx && 'diagnosis',
+      ].filter(Boolean)
+    : [];
+
   return (
     <div className={`mt-4 rounded-lg border ${style.border} ${style.bg} p-5`}>
       <div className="flex items-center justify-between mb-3">
@@ -110,6 +119,18 @@ function DenialRiskCard({ claimId }) {
       <p className="text-3xl font-bold text-gray-900 mb-3">{scorePercent}%
         <span className="text-sm font-normal text-gray-500 ml-2">risk score</span>
       </p>
+
+      {unseenDims.length > 0 && (
+        <div
+          className="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+          role="status"
+        >
+          <span className="font-semibold uppercase tracking-wide">New data:</span>{' '}
+          this claim's {unseenDims.join(' / ')} {unseenDims.length === 1 ? 'was' : 'were'}{' '}
+          not in the model's training vocabulary. Treat the risk score as
+          low-confidence and verify the value{unseenDims.length === 1 ? '' : 's'}.
+        </div>
+      )}
 
       {prediction.top_risk_factors?.length > 0 && (
         <div className="mb-3">

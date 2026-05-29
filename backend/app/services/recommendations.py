@@ -188,6 +188,19 @@ ML_FEATURE_HINTS: dict[str, str] = {
     "Diagnosis Claim Volume": "Low historical volume for this diagnosis — confirm the ICD-10 is correct and specific.",
     "Rare Payer": "Rare payer for this practice — confirm payer enrollment and filing setup.",
     "Rare Procedure": "Rare procedure code — confirm code accuracy and that documentation supports it.",
+    # Unseen-at-training: the model has no historical baseline for this value.
+    # The hint distinguishes "we've never seen this" from "we've seen it but
+    # rarely" — billers should treat the risk score as low-confidence and
+    # double-check the value is correct (typo / new payer onboarding) before
+    # acting on it.
+    "New Payer (no training history)":
+        "This payer was not in the model's training data — confirm the payer ID is correct (typo or new payer onboarding?), verify enrollment, and treat the risk score as low-confidence until more reconciled outcomes from this payer accumulate.",
+    "New Procedure Code (no training history)":
+        "This CPT/HCPCS code was not in the model's training data — confirm the code is correct and that documentation supports it; the model has no historical baseline for this procedure.",
+    "New Diagnosis Code (no training history)":
+        "This diagnosis code was not in the model's training data — confirm the ICD-10 code is correct and current for the date of service; the model has no historical baseline for this diagnosis.",
+    "New Payer/CPT/Dx Combination":
+        "One or more fields on this claim (payer, procedure, diagnosis) were not seen during training — treat the model's risk score as low-confidence and verify the unfamiliar value(s) before submission.",
 }
 
 ADJUSTMENT_GROUP_LABELS: dict[str, str] = {

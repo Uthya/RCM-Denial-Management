@@ -46,6 +46,17 @@ class RiskFactor(BaseModel):
     direction: str
 
 
+class UnseenIndicators(BaseModel):
+    """Per-claim flag: which (if any) categorical fields were not in the
+    model's training vocabulary. ``any`` is True when any of the three
+    dimensions is True."""
+
+    payer: bool
+    cpt: bool
+    dx: bool
+    any: bool
+
+
 class PredictionResponse(BaseModel):
     prediction_id: str
     risk_score: float
@@ -54,6 +65,12 @@ class PredictionResponse(BaseModel):
     model_version: str
     feature_version: str
     prediction_timestamp: str
+    # Optional v3.3+ fields (omitted by older models so the schema stays
+    # backward compatible).
+    raw_risk_score: float | None = None
+    predicted_label: int | None = None
+    decision_threshold: float | None = None
+    unseen_indicators: UnseenIndicators | None = None
 
 
 class ClaimPrediction(BaseModel):
@@ -64,6 +81,9 @@ class ClaimPrediction(BaseModel):
     risk_score: float
     risk_level: str
     top_risk_factors: list[RiskFactor]
+    # True iff any of payer/CPT/Dx for this claim was not in the model's
+    # training vocabulary. Used by the upload UI to badge "new data" claims.
+    unseen_any: bool | None = None
 
 
 class FilePredictionResponse(BaseModel):
@@ -237,6 +257,7 @@ async def predict_file(edi_file_id: int, db: AsyncSession = Depends(get_db)):
         try:
             pred_input = _claim_to_predict_dict(claim)
             pred = predictor.predict(pred_input)
+            unseen = pred.get("unseen_indicators") or {}
             results.append(ClaimPrediction(
                 claim_id=claim.id,
                 claim_number=claim.claim_number,
@@ -245,6 +266,7 @@ async def predict_file(edi_file_id: int, db: AsyncSession = Depends(get_db)):
                 risk_score=pred["risk_score"],
                 risk_level=pred["risk_level"],
                 top_risk_factors=pred["top_risk_factors"],
+                unseen_any=bool(unseen.get("any")) if unseen else None,
             ))
             log_entries.append({
                 "claim_id": claim.id,
@@ -294,26 +316,45 @@ async def dataset_stats(db: AsyncSession = Depends(get_db)):
 @router.post("/train")
 async def train_denial_model(
     db: AsyncSession = Depends(get_db),
+    mode: str = Query(
+        "full",
+        regex="^(full|warm|quick)$",
+        description=(
+            "Retrain mode. 'full' = Optuna search + isotonic calibration "
+            "(use after feature changes or scheduled retrains). "
+            "'warm' = reuse last good hyperparameters, skip Optuna entirely "
+            "(routine retrains; falls back to full if no compatible prior "
+            "artifact). 'quick' = warm + 3-fold calibration (fastest)."
+        ),
+    ),
     tune: bool = Query(
         True,
-        description="Tune hyperparameters with Optuna (cross-validated on the "
-        "training split). Disable for a fast baseline model.",
+        description="Tune hyperparameters with Optuna (full mode only).",
     ),
-    n_trials: int = Query(
-        30, ge=1, le=200, description="Maximum Optuna trials when tuning."
+    n_trials: int | None = Query(
+        None,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum Optuna trials. Omit for an adaptive budget based on "
+            "dataset size (5/10/20/30 for <500/<5k/<50k/>=50k rows)."
+        ),
     ),
     tuning_timeout: int | None = Query(
         180,
         ge=1,
-        description="Wall-clock budget for tuning in seconds. Tuning stops at "
-        "whichever of n_trials or this limit comes first.",
+        description="Wall-clock budget for tuning in seconds.",
     ),
 ):
     from app.ml.trainer import train_model
     from app.ml.predictor import get_predictor
     try:
         result = await train_model(
-            db, tune=tune, n_trials=n_trials, tuning_timeout=tuning_timeout
+            db,
+            tune=tune,
+            n_trials=n_trials,
+            tuning_timeout=tuning_timeout,
+            mode=mode,
         )
         # Reload the singleton predictor so it picks up the new artifacts
         get_predictor().load()

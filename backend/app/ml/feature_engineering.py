@@ -21,7 +21,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-FEATURE_ENGINEERING_VERSION = "v3"
+FEATURE_ENGINEERING_VERSION = "v4"
+# v3 -> v4: explicit unseen-category indicators (payer/CPT/Dx/any) and a
+# persisted training-time category vocabulary, so inference can distinguish
+# "category never seen in training" from "category seen but never denied."
 
 # Sentinel string used when stringifying nullable categorical values for joint
 # keys. Keeps the joint cardinality meaningful (e.g. "ACME||missing") instead
@@ -117,6 +120,14 @@ FEATURE_COLUMNS: list[str] = [
     "dx_volume",
     "is_rare_payer",
     "is_rare_cpt",
+    # Unseen-at-training indicators (v4). Distinguish "we've never seen this
+    # value in training" from "we've seen it but it had zero denials" — both
+    # used to produce identical low encoded values, blinding the model to a
+    # very different operational situation.
+    "unseen_payer",
+    "unseen_cpt",
+    "unseen_dx",
+    "unseen_any",
 ]
 
 
@@ -166,6 +177,10 @@ _FEATURE_METADATA: list[FeatureMeta] = [
     FeatureMeta("dx_volume", "int64", "primary_diagnosis_code", "training count"),
     FeatureMeta("is_rare_payer", "int64", "payer_name", f"payer_volume < {_RARE_PAYER_THRESHOLD}"),
     FeatureMeta("is_rare_cpt", "int64", "primary_procedure_code", f"cpt_volume < {_RARE_CPT_THRESHOLD}"),
+    FeatureMeta("unseen_payer", "int64", "payer_name", "value not in training-time vocabulary"),
+    FeatureMeta("unseen_cpt", "int64", "primary_procedure_code", "value not in training-time vocabulary"),
+    FeatureMeta("unseen_dx", "int64", "primary_diagnosis_code", "value not in training-time vocabulary"),
+    FeatureMeta("unseen_any", "int64", "payer/cpt/dx", "any of unseen_payer/cpt/dx is 1"),
 ]
 
 
@@ -250,7 +265,18 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         "dx_volume",
         "is_rare_payer",
         "is_rare_cpt",
+        "unseen_payer",
+        "unseen_cpt",
+        "unseen_dx",
+        "unseen_any",
     ]
+
+    # Source columns whose vocabularies we persist for the unseen-* flags.
+    _VOCABULARY_COLUMNS: ClassVar[dict[str, str]] = {
+        "unseen_payer": "payer_name",
+        "unseen_cpt": "primary_procedure_code",
+        "unseen_dx": "primary_diagnosis_code",
+    }
 
     def __init__(self) -> None:
         self.target_encoder_: TargetEncoder | None = None
@@ -260,6 +286,11 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         # Used at inference to surface "how often did we see this value"
         # without having to re-scan the training set.
         self.volume_lookups_: dict[str, dict[str, int]] | None = None
+        # Training-time vocabulary per source column (v4). Used at inference
+        # to set unseen_* flags so the model can distinguish "never seen"
+        # from "seen but never denied" — those used to look identical.
+        self.category_vocabularies_: dict[str, frozenset[str]] | None = None
+        self.n_features_in_: int | None = None
         self._is_fitted: bool = False
 
     # ---- private helpers -------------------------------------------------
@@ -336,10 +367,20 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         return out
 
     def _prepare_categorical_input(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract categorical columns as a string DataFrame for TargetEncoder."""
+        """Extract categorical columns as a string DataFrame for TargetEncoder.
+
+        Missing values are stringified to the ``__missing__`` sentinel rather
+        than left as ``NaN``. Reason: sklearn's TargetEncoder ``transform``
+        path crashes (``isnan`` on object-dtype categories_) when training
+        data had no NaN for a column but inference does. Treating missing as
+        a category aligns with the joint encoder and makes single-row
+        inference with nullable categoricals deterministic; the dedicated
+        ``missing_*`` flag features still carry the missingness signal
+        explicitly to the model.
+        """
         cat_df = df[_CATEGORICAL_COLUMNS].copy()
         for col in _CATEGORICAL_COLUMNS:
-            cat_df[col] = cat_df[col].astype(str).replace("nan", np.nan).replace("None", np.nan)
+            cat_df[col] = self._stringify(cat_df[col])
         return cat_df
 
     @staticmethod
@@ -371,6 +412,40 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
             counts = self._stringify(df[col]).value_counts()
             lookups[col] = counts.to_dict()
         return lookups
+
+    def _compute_category_vocabularies(
+        self, df: pd.DataFrame
+    ) -> dict[str, frozenset[str]]:
+        """Snapshot the set of distinct non-missing categorical values per source
+        column. Missing values are EXCLUDED so they're handled by the missing_*
+        flags, not conflated with unseen-at-training.
+        """
+        vocab: dict[str, frozenset[str]] = {}
+        for src_col in self._VOCABULARY_COLUMNS.values():
+            stringified = self._stringify(df[src_col])
+            values = {v for v in stringified.unique() if v != _MISSING_SENTINEL}
+            vocab[src_col] = frozenset(values)
+        return vocab
+
+    def _apply_unseen_flags(self, out: pd.DataFrame, df: pd.DataFrame) -> None:
+        """Append unseen_payer / unseen_cpt / unseen_dx / unseen_any flags.
+
+        ``unseen_X`` is 1 when the row's value for source column X is non-missing
+        AND wasn't in the training-time vocabulary. Missing values are NOT
+        flagged unseen (they're covered by missing_X), so the two signals stay
+        independent.
+        """
+        assert self.category_vocabularies_ is not None, "vocabularies must be fitted"
+        unseen_any = pd.Series(0, index=df.index, dtype="int64")
+        for feat_name, src_col in self._VOCABULARY_COLUMNS.items():
+            stringified = self._stringify(df[src_col])
+            seen = self.category_vocabularies_.get(src_col, frozenset())
+            # value is unseen if it's not missing AND not in the seen vocab.
+            mask = (stringified != _MISSING_SENTINEL) & (~stringified.isin(seen))
+            flag = mask.astype("int64")
+            out[feat_name] = flag
+            unseen_any = (unseen_any | flag).astype("int64")
+        out["unseen_any"] = unseen_any
 
     def _apply_joint_encoding(
         self, out: pd.DataFrame, df: pd.DataFrame, *, is_training: bool, y=None
@@ -469,22 +544,27 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         # Volume lookups for reliability features.
         self.volume_lookups_ = self._compute_volume_lookups(df)
 
+        # Category vocabularies for unseen-* flags (v4).
+        self.category_vocabularies_ = self._compute_category_vocabularies(df)
+
         # 75th percentile threshold for high_charge_claim
         self.high_charge_threshold_ = float(
             df["total_charge_amount"].quantile(0.75)
         )
 
+        self.n_features_in_ = len(FEATURE_COLUMNS)
         self._is_fitted = True
         return self
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Produce the 31-column feature matrix from a raw DataFrame."""
+        """Produce the full feature matrix from a raw DataFrame."""
         if not self._is_fitted:
             raise RuntimeError("FeatureEngineer has not been fitted. Call fit() first.")
 
         out = self._build_base_features(df)
 
-        # 13-18: Categorical target encoding
+        # Categorical target encoding (deployment mapping — produces the
+        # values inference will see for these rows).
         cat_df = self._prepare_categorical_input(df)
         encoded = self.target_encoder_.transform(cat_df)
         encoded_df = pd.DataFrame(
@@ -495,9 +575,11 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         for col in encoded_df.columns:
             out[col] = encoded_df[col]
 
-        # 24-31: Joint denial-rate aggregations + volume / reliability features.
+        # Joint denial-rate aggregations + volume / reliability features +
+        # unseen-at-training indicators.
         self._apply_joint_encoding(out, df, is_training=False)
         self._apply_volume_features(out, df)
+        self._apply_unseen_flags(out, df)
 
         return self._finalize(out, df)
 
@@ -523,6 +605,9 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         # Volume lookups (target-independent, so compute up front).
         self.volume_lookups_ = self._compute_volume_lookups(df)
 
+        # Category vocabularies for unseen-* flags (v4).
+        self.category_vocabularies_ = self._compute_category_vocabularies(df)
+
         out = self._build_base_features(df)
 
         # TargetEncoder — fit_transform uses internal CV to avoid leakage
@@ -545,9 +630,11 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         # Joint denial-rate aggregations (also CV-folded internally).
         self._apply_joint_encoding(out, df, is_training=True, y=y)
 
-        # Volume / rarity features.
+        # Volume / rarity features + unseen-at-training indicators.
         self._apply_volume_features(out, df)
+        self._apply_unseen_flags(out, df)
 
+        self.n_features_in_ = len(FEATURE_COLUMNS)
         self._is_fitted = True
         return self._finalize(out, df)
 
@@ -566,40 +653,48 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
             "target_encoder": self.target_encoder_,
             "joint_target_encoder": self.joint_target_encoder_,
             "volume_lookups": self.volume_lookups_,
+            "category_vocabularies": self.category_vocabularies_,
             "high_charge_threshold": self.high_charge_threshold_,
             "feature_columns": FEATURE_COLUMNS,
+            "n_features_in": self.n_features_in_,
         }
         joblib.dump(state, path)
         logger.info("Saved FeatureEngineer state to %s", path)
 
     @classmethod
     def load(cls, path: str | Path) -> FeatureEngineer:
-        """Load a fitted FeatureEngineer from disk."""
+        """Load a fitted FeatureEngineer from disk.
+
+        Strict-fail on version or feature-column mismatch: a v3 artifact paired
+        with v4 code (or vice versa) would produce silently wrong feature
+        vectors at inference, so refuse to load rather than warn.
+        """
         state = joblib.load(path)
 
-        # Version check
         saved_version = state.get("version")
         if saved_version != FEATURE_ENGINEERING_VERSION:
-            logger.warning(
-                "FeatureEngineer version mismatch: saved=%s, current=%s",
-                saved_version,
-                FEATURE_ENGINEERING_VERSION,
+            raise ValueError(
+                f"FeatureEngineer version mismatch: saved={saved_version!r}, "
+                f"current={FEATURE_ENGINEERING_VERSION!r}. Retrain the model — "
+                "loading an artifact built under a different feature-engineering "
+                "version risks silently-wrong predictions."
             )
 
-        # Feature column check
         saved_columns = state.get("feature_columns", [])
         if saved_columns != FEATURE_COLUMNS:
-            logger.warning(
-                "Feature columns mismatch: saved %d columns vs current %d columns",
-                len(saved_columns),
-                len(FEATURE_COLUMNS),
+            raise ValueError(
+                f"Feature columns mismatch: saved {len(saved_columns)} cols, "
+                f"current {len(FEATURE_COLUMNS)} cols. Retrain to regenerate "
+                f"the artifact."
             )
 
         instance = cls()
         instance.target_encoder_ = state["target_encoder"]
         instance.joint_target_encoder_ = state.get("joint_target_encoder")
         instance.volume_lookups_ = state.get("volume_lookups")
+        instance.category_vocabularies_ = state.get("category_vocabularies")
         instance.high_charge_threshold_ = state["high_charge_threshold"]
+        instance.n_features_in_ = state.get("n_features_in", len(FEATURE_COLUMNS))
         instance._is_fitted = True
         return instance
 

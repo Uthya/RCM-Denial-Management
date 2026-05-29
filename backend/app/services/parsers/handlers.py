@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from app.models.adjustment import Adjustment
 from app.models.claim import Claim
@@ -444,27 +445,17 @@ def handle_cas(
             f"CAS at pos {ctx.segment_position}: missing adjustment_group_code"
         )
 
+    triplets, warnings = _parse_cas_triplets(elements[2:], ctx.segment_position)
+    for w in warnings:
+        logger.warning(w)
+
     adjustments: list[Adjustment] = []
-    # Triplets start at index 2: reason, amount, quantity (optional)
-    # Indices: 2/3, 5/6, 8/9, 11/12, 14/15, 17/18
-    for start in range(2, len(elements), 3):
-        reason = safe_element(elements, start)
-        if not reason:
-            break
-
-        amount = safe_decimal(safe_element(elements, start + 1))
-        if amount is None:
-            logger.warning(
-                "CAS at pos %d: invalid amount for reason=%s, skipping triplet",
-                ctx.segment_position,
-                reason,
-            )
-            continue
-
+    for reason, amount, quantity in triplets:
         adj = Adjustment(
             adjustment_group_code=group_code,
             adjustment_reason_code=reason,
             adjustment_amount=amount,
+            quantity=quantity,
             raw_cas_segment=raw_text,
         )
         # Tag parent for FK resolution after flush
@@ -479,6 +470,145 @@ def handle_cas(
         ctx.segment_position,
     )
     return adjustments
+
+
+# ---------------------------------------------------------------------------
+# CAS triplet parser
+# ---------------------------------------------------------------------------
+
+def _parse_cas_triplets(
+    elements_post_group: list[str], segment_pos: int
+) -> tuple[list[tuple[str, Decimal, Decimal | None]], list[str]]:
+    """Parse CAS triplets, tolerant of both X12 spec and compact payer forms.
+
+    X12 005010 CAS is a fixed-stride-3 segment: each adjustment occupies
+    exactly three positions (reason, amount, quantity), and the quantity slot
+    may be empty. Trailing empty positions may be truncated by the sender, so
+    spec-compliant element counts after CAS01 are 2, 3, 5, 6, 8, 9, … — i.e.
+    any count with ``count % 3 != 1``.
+
+    Non-spec "compact" payers drop empty quantity slots entirely and emit
+    reason+amount pairs only (counts 2, 4, 6, 8, …). Both forms must be
+    handled or denial dollar amounts and CARC codes get misaligned across
+    triplets.
+
+    Strategy:
+    1. If element count clearly fits compact only (``count % 3 == 1``), use
+       stride-2.
+    2. Otherwise try stride-3 first; fall back to stride-2 only if stride-3
+       leaves a clearly broken triplet behind (more triplets parse under
+       stride-2 than stride-3).
+    3. Track and return warnings for any non-spec / partial parses so the
+       caller can log them.
+
+    Parameters
+    ----------
+    elements_post_group : list[str]
+        The segment elements AFTER CAS01 (the group code) — i.e. everything
+        from the first reason onward. Empty strings are preserved.
+    segment_pos : int
+        File position of the CAS segment, used only for warning messages.
+
+    Returns
+    -------
+    triplets : list[(reason, amount, quantity_or_None)]
+    warnings : list[str]
+    """
+
+    def _attempt(stride: int) -> tuple[list[tuple[str, Decimal, Decimal | None]], bool]:
+        """Walk the element stream with a given stride. ``complete`` is True
+        iff we stopped on a natural end (empty/trailing) rather than on a
+        malformed reason/amount pair."""
+        triplets_inner: list[tuple[str, Decimal, Decimal | None]] = []
+        complete = True
+        n = len(elements_post_group)
+        i = 0
+        while i < n:
+            reason = (elements_post_group[i] or "").strip()
+            if not reason:
+                break  # natural end — trailing empties are OK
+            if i + 1 >= n:
+                complete = False
+                break
+            amount_str = (elements_post_group[i + 1] or "").strip()
+            if not amount_str:
+                complete = False
+                break
+            try:
+                amount = Decimal(amount_str)
+            except (InvalidOperation, ValueError):
+                complete = False
+                break
+            quantity: Decimal | None = None
+            if stride == 3 and i + 2 < n:
+                q_str = (elements_post_group[i + 2] or "").strip()
+                if q_str:
+                    try:
+                        quantity = Decimal(q_str)
+                    except (InvalidOperation, ValueError):
+                        quantity = None  # tolerate bad quantity, keep triplet
+            triplets_inner.append((reason, amount, quantity))
+            i += stride
+        return triplets_inner, complete
+
+    warnings: list[str] = []
+    cleaned = [(e or "").strip() for e in elements_post_group]
+    if not any(cleaned):
+        return [], warnings
+
+    # Determine the meaningful element count: strip pure trailing empties
+    # (spec permits truncating empty positions at the end of the segment)
+    # but preserve any *internal* empty positions — those are quantity
+    # placeholders and are a strong signal of spec stride-3 form.
+    trimmed = list(cleaned)
+    while trimmed and not trimmed[-1]:
+        trimmed.pop()
+    has_internal_empty = any(not v for v in trimmed)
+    effective_count = len(trimmed)
+
+    # No internal empties + count incompatible with spec stride-3
+    # (effective_count % 3 == 1) → must be compact stride-2 form.
+    if not has_internal_empty and effective_count % 3 == 1:
+        triplets_2, complete_2 = _attempt(stride=2)
+        if complete_2 and triplets_2:
+            warnings.append(
+                f"CAS at pos {segment_pos}: non-spec compact form "
+                f"({effective_count} non-empty elements, no quantity captured)"
+            )
+            return triplets_2, warnings
+
+    # Try spec stride-3 first.
+    triplets_3, complete_3 = _attempt(stride=3)
+    if complete_3 and triplets_3:
+        return triplets_3, warnings
+
+    # Stride-3 incomplete — try stride-2 as fallback.
+    triplets_2, complete_2 = _attempt(stride=2)
+    if complete_2 and len(triplets_2) > len(triplets_3):
+        warnings.append(
+            f"CAS at pos {segment_pos}: stride-3 incomplete after {len(triplets_3)} "
+            f"triplet(s); falling back to compact stride-2 ({len(triplets_2)} triplets)"
+        )
+        return triplets_2, warnings
+
+    if triplets_3:
+        warnings.append(
+            f"CAS at pos {segment_pos}: partial stride-3 parse — "
+            f"{len(triplets_3)} triplet(s) captured; remaining elements may be malformed"
+        )
+        return triplets_3, warnings
+    if triplets_2:
+        warnings.append(
+            f"CAS at pos {segment_pos}: partial stride-2 parse — "
+            f"{len(triplets_2)} triplet(s) captured"
+        )
+        return triplets_2, warnings
+
+    warnings.append(
+        f"CAS at pos {segment_pos}: no valid triplets parsed from "
+        f"{effective_count} non-empty element(s)"
+    )
+    return [], warnings
 
 
 # ---------------------------------------------------------------------------
