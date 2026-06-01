@@ -201,6 +201,23 @@ ML_FEATURE_HINTS: dict[str, str] = {
         "This diagnosis code was not in the model's training data — confirm the ICD-10 code is correct and current for the date of service; the model has no historical baseline for this diagnosis.",
     "New Payer/CPT/Dx Combination":
         "One or more fields on this claim (payer, procedure, diagnosis) were not seen during training — treat the model's risk score as low-confidence and verify the unfamiliar value(s) before submission.",
+    "New Payer/CPT/Dx/Provider Combination":
+        "One or more fields on this claim (payer, procedure, diagnosis, billing or rendering NPI) were not seen during training — treat the model's risk score as low-confidence and verify the unfamiliar value(s) before submission.",
+    # v5 — authorization / referral / provider / timely-filing hints.
+    "Prior Authorization Present":
+        "Authorization presence influenced the risk — verify the authorization number (REF*G1) is valid for this DOS and CPT, and that the units billed do not exceed what was authorized (CARC 198).",
+    "Referral Present":
+        "Referral presence influenced the risk — verify the referral number (REF*9F) is on file for this PCP / payer and is valid for the date of service (CARC 165).",
+    "Billing Provider":
+        "Submissions under this billing NPI historically show elevated denial rates — confirm payer enrollment / credentialing for this NPI before resubmission (CARC 38, 170, 185, 242).",
+    "Rendering Provider":
+        "Submissions under this rendering NPI historically show elevated denial rates — confirm the rendering provider is credentialed with this payer for this CPT (CARC 185, 242).",
+    "New Billing Provider (no training history)":
+        "This billing NPI was not in the model's training data — confirm the NPI is correct and that the billing provider is enrolled / credentialed with this payer; treat the risk score as low-confidence.",
+    "New Rendering Provider (no training history)":
+        "This rendering NPI was not in the model's training data — confirm the rendering provider is credentialed for this CPT with this payer; treat the risk score as low-confidence.",
+    "Days from Service to Submission":
+        "The lag between date of service and submission contributed to the risk — review the payer's timely-filing window (CARC 29) and submit corrected claims with proof of original submission if approaching the deadline.",
 }
 
 ADJUSTMENT_GROUP_LABELS: dict[str, str] = {

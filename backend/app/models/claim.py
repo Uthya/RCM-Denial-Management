@@ -32,6 +32,15 @@ class Claim(TimestampMixin, Base):
     raw_claim_segment: Mapped[str | None] = mapped_column(Text)
     previous_payer_claim_control_no: Mapped[str | None] = mapped_column(String(50))
 
+    # v5 feature inputs — captured from 837 segments, surfaced to the ML
+    # pipeline by ``app.ml.dataset.build_dataset``. All nullable: real-world
+    # 837s frequently omit any of these (which is itself signal — the
+    # has_prior_authorization / has_referral features encode "present vs not").
+    authorization_number: Mapped[str | None] = mapped_column(String(50))
+    referral_number: Mapped[str | None] = mapped_column(String(50))
+    billing_provider_npi: Mapped[str | None] = mapped_column(String(20), index=True)
+    rendering_provider_npi: Mapped[str | None] = mapped_column(String(20), index=True)
+
     edi_file: Mapped["EdiFile | None"] = relationship(back_populates="claims")
     claim_lines: Mapped[list["ClaimLine"]] = relationship(
         back_populates="claim", cascade="all, delete-orphan"

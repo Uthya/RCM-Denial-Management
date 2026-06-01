@@ -67,7 +67,12 @@ from app.models.training_metric import TrainingMetric
 # fixed <5% calibrated probability (test-set LOW denial rate drops 1.7% -> 0.8%);
 # calibration CV folds bumped 3 -> 5 for finer-grained OOF probability
 # estimation in the low-score region.
-MODEL_VERSION = "v3.4"
+# v3.4 -> v3.5: feature engineering v4 -> v5 (authorization/referral flags,
+# provider-NPI target encoding + unseen flags, service-to-submission days).
+# Feature count grew 35 -> 42; the v3.4 calibrator is incompatible with the
+# v3.5 model and the predictor's strict-fail loader will reject any
+# cross-version pairing. Retrain from scratch in mode=full.
+MODEL_VERSION = "v3.5"
 
 logger = logging.getLogger(__name__)
 
@@ -909,7 +914,7 @@ def _run_training(
             feature_df=X_train,
             training_scores=training_scores,
             trained_at=trained_at,
-            feature_version="v3",
+            feature_version=FEATURE_ENGINEERING_VERSION,
             model_version=MODEL_VERSION,
         )
         save_distribution_snapshot(snapshot, settings.ML_DISTRIBUTIONS_PATH)

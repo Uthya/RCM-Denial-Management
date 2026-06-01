@@ -76,6 +76,19 @@ async def build_dataset(db: AsyncSession) -> pd.DataFrame:
         sorted_lines = sorted(claim.claim_lines, key=lambda l: l.line_number)
         sorted_diagnoses = sorted(claim.diagnoses, key=lambda d: d.sequence_number)
 
+        # Submission timestamp: ``claim.created_at`` is populated by the
+        # TimestampMixin when the 837 is ingested (same transaction as the
+        # parent EdiFile row), so it tracks "when this submission landed in
+        # our system" to within milliseconds of edi_file.created_at.
+        # Strictly precedes any 835/denial outcome — no future-information
+        # leakage by construction. ``.date()`` strips the timezone-aware
+        # datetime down to a calendar date for the day-delta feature.
+        submission_date = (
+            claim.created_at.date()
+            if claim.created_at is not None
+            else None
+        )
+
         rows.append(
             {
                 "claim_id": claim.id,
@@ -113,6 +126,12 @@ async def build_dataset(db: AsyncSession) -> pd.DataFrame:
                 "place_of_service": (
                     sorted_lines[0].place_of_service if sorted_lines else None
                 ),
+                # v5 columns — authorization/referral/provider/timing.
+                "authorization_number": claim.authorization_number,
+                "referral_number": claim.referral_number,
+                "billing_provider_npi": claim.billing_provider_npi,
+                "rendering_provider_npi": claim.rendering_provider_npi,
+                "submission_date": submission_date,
             }
         )
 

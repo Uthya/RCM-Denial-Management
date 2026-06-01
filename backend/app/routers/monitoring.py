@@ -106,6 +106,11 @@ _UNSEEN_DIMENSIONS: dict[str, str] = {
     "payer": "payer_name",
     "cpt": "primary_procedure_code",
     "dx": "primary_diagnosis_code",
+    # v5: provider NPIs join the OOV roll-up. New billing/rendering NPIs
+    # are an early-warning signal — they often correlate with provider-
+    # credentialing denials (CARC 38, 170, 185, 242) before the 835 arrives.
+    "billing_provider": "billing_provider_npi",
+    "rendering_provider": "rendering_provider_npi",
 }
 
 

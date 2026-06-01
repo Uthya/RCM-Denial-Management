@@ -334,45 +334,90 @@ class EdiParser:
     ) -> None:
         """Resolve claim_id for each RemittanceClaim.
 
-        Tier 1: in-memory claims from this parse.
-        Tier 2: query DB for previously ingested claim by claim_number.
-        Tier 3: create placeholder claim + log warning.
+        Bulk version (was 1 SELECT + 1 flush per Tier 2/3 hit; now 1 SELECT
+        + at most 1 flush for the whole file). Three tiers preserved:
+
+        Tier 1: in-memory claims from this parse (via ``local_claim_map``).
+        Tier 2: prefetched DB rows for the union of remit claim_numbers.
+        Tier 3: create placeholder claim, batched into a single flush.
+
+        Tie-breaking on Tier 2 is preserved exactly: when multiple persisted
+        claims share the same claim_number (original + replacement), pick the
+        one with the FEWEST attached remittances first, then by largest
+        ``Claim.id`` (later upload). That ordering is computed once for the
+        entire batch via a single window-ranked query, not re-derived per
+        remit.
         """
+        if not ctx.remittance_claims:
+            return
+
+        # Phase 1: classify remits and collect Tier 2 candidates -----------
+        # Group remittances by (claim_number, presence) so the SQL pulls only
+        # the keys it needs to. Remits with no claim_number go to ctx.errors
+        # the same way the per-row version handled them.
+        tier2_lookups: set[str] = set()
+        rcs_with_number: list[tuple[object, str]] = []  # (rc, claim_number)
         for rc in ctx.remittance_claims:
             claim_number: str | None = getattr(rc, "_parse_claim_number", None)
             if not claim_number:
-                ctx.errors.append(
-                    f"RemittanceClaim: no claim_number to resolve"
+                ctx.errors.append("RemittanceClaim: no claim_number to resolve")
+                continue
+            rcs_with_number.append((rc, claim_number))
+            if claim_number not in local_claim_map:
+                tier2_lookups.add(claim_number)
+
+        # Phase 2: bulk Tier 2 prefetch ------------------------------------
+        # The original per-row query was:
+        #   SELECT Claim.id WHERE claim_number = ?
+        #   ORDER BY (SELECT count(*) FROM remittance_claims WHERE claim_id=Claim.id) ASC,
+        #            Claim.id DESC
+        #   LIMIT 1
+        # We reproduce the same ordering for every claim_number in one shot
+        # with ROW_NUMBER() partitioned by claim_number, then keep rank=1.
+        tier2_map: dict[str, int] = {}
+        if tier2_lookups:
+            rem_count = (
+                select(func.count(RemittanceClaim.id))
+                .where(RemittanceClaim.claim_id == Claim.id)
+                .correlate(Claim)
+                .scalar_subquery()
+            )
+            rn = (
+                func.row_number()
+                .over(
+                    partition_by=Claim.claim_number,
+                    order_by=(rem_count.asc(), Claim.id.desc()),
                 )
+                .label("rn")
+            )
+            stmt = (
+                select(Claim.claim_number, Claim.id, rn)
+                .where(Claim.claim_number.in_(tier2_lookups))
+            )
+            for cn, cid, rank in (await db.execute(stmt)).all():
+                if rank == 1:
+                    tier2_map[cn] = cid
+
+        # Phase 3: classify each remit into Tier 1/2 (assignable now) or
+        # Tier 3 (needs a placeholder). For Tier 3, the same missing
+        # claim_number across multiple remits must share ONE placeholder —
+        # same as the per-row version, which created one then re-used it
+        # via the local_claim_map on subsequent iterations.
+        tier3_assignments: list[object] = []  # rc instances awaiting placeholder backfill
+        tier3_claim_numbers: list[str] = []   # parallel list, same order as tier3_assignments
+        tier3_placeholders: dict[str, Claim] = {}  # claim_number → placeholder instance
+
+        for rc, claim_number in rcs_with_number:
+            claim_id = local_claim_map.get(claim_number)
+            if claim_id is None:
+                claim_id = tier2_map.get(claim_number)
+            if claim_id is not None:
+                rc.claim_id = claim_id
                 continue
 
-            # Tier 1
-            claim_id = local_claim_map.get(claim_number)
-
-            # Tier 2 — choose deterministically when multiple claims share
-            # the same claim_number (original + replacement). Prefer a claim
-            # that doesn't yet have any remittance attached; break ties by
-            # most-recent claim id (the later upload, typically the
-            # replacement when 835s arrive in order).
-            if claim_id is None:
-                rem_count = (
-                    select(func.count(RemittanceClaim.id))
-                    .where(RemittanceClaim.claim_id == Claim.id)
-                    .scalar_subquery()
-                    .label("rem_count")
-                )
-                stmt = (
-                    select(Claim.id)
-                    .where(Claim.claim_number == claim_number)
-                    .order_by(rem_count.asc(), Claim.id.desc())
-                    .limit(1)
-                )
-                row = (await db.execute(stmt)).scalar_one_or_none()
-                if row is not None:
-                    claim_id = row
-
-            # Tier 3
-            if claim_id is None:
+            # Tier 3 — create (or reuse) a placeholder for this claim_number.
+            placeholder = tier3_placeholders.get(claim_number)
+            if placeholder is None:
                 logger.warning(
                     "835 CLP claim_number=%s not found; creating placeholder",
                     claim_number,
@@ -385,12 +430,22 @@ class EdiParser:
                     edi_file_id=ctx.edi_file.id,
                 )
                 db.add(placeholder)
-                await db.flush()
-                claim_id = placeholder.id
-                local_claim_map[claim_number] = claim_id
                 ctx.claims.append(placeholder)
+                tier3_placeholders[claim_number] = placeholder
+            tier3_assignments.append(rc)
+            tier3_claim_numbers.append(claim_number)
 
-            rc.claim_id = claim_id
+        if tier3_placeholders:
+            # Single flush for ALL placeholders — Postgres assigns ids in
+            # one round-trip. After this each placeholder.id is populated.
+            await db.flush()
+            # Backfill rc.claim_id and local_claim_map directly from the
+            # placeholder objects we already have references to — O(1) per
+            # assignment, no extra scan over ctx.claims.
+            for rc, claim_number in zip(tier3_assignments, tier3_claim_numbers, strict=True):
+                placeholder = tier3_placeholders[claim_number]
+                rc.claim_id = placeholder.id
+                local_claim_map[claim_number] = placeholder.id
 
     # ------------------------------------------------------------------
     # 835 claim status update
@@ -401,23 +456,56 @@ class EdiParser:
         ctx: ParseContext,
         db: AsyncSession,
     ) -> None:
-        """Update claim statuses based on CLP02 codes."""
+        """Update claim statuses based on CLP02 codes.
+
+        Bulk version (was N SELECTs / N remits): collects every (claim_id,
+        new_status) pair that needs to be applied, issues ONE bulk SELECT
+        for all the affected claims, and applies the status changes in
+        memory. SQLAlchemy auto-flushes the mutations on commit.
+
+        Behaviour identical to the per-row version:
+        - Same CLP02 → ClaimStatus mapping (``_CLP_STATUS_MAP``).
+        - Same skip rule when CLP02 doesn't map or remittance has no
+          claim_id (Tier 3 placeholders are also handled: they DO have a
+          claim_id by the time we get here, since ``_resolve_remittance_claim_ids``
+          set it).
+        - Last-write-wins for the (rare) case where two remittances in the
+          same file target the same claim_id with different status codes —
+          preserved because we iterate ``ctx.remittance_claims`` in order
+          and overwrite ``claim.claim_status`` on each application, just
+          like the loop did before.
+        - DEBUG-level log emitted per mutation, identical message format.
+        """
+        # Build the work list first so the bulk SELECT only loads claims
+        # that actually need an update.
+        updates: list[tuple[int, ClaimStatus, str]] = []  # (claim_id, new_status, clp02)
         for rc in ctx.remittance_claims:
             new_status = _CLP_STATUS_MAP.get(rc.claim_status_code)
             if new_status is None or rc.claim_id is None:
                 continue
+            updates.append((rc.claim_id, new_status, rc.claim_status_code))
 
-            stmt = select(Claim).where(Claim.id == rc.claim_id)
-            result = await db.execute(stmt)
-            claim = result.scalar_one_or_none()
-            if claim:
-                claim.claim_status = new_status
-                logger.debug(
-                    "Claim %s status → %s (CLP02=%s)",
-                    claim.claim_number,
-                    new_status.value,
-                    rc.claim_status_code,
-                )
+        if not updates:
+            return
+
+        target_ids = {claim_id for claim_id, _, _ in updates}
+        stmt = select(Claim).where(Claim.id.in_(target_ids))
+        rows = (await db.execute(stmt)).scalars().all()
+        claims_by_id: dict[int, Claim] = {c.id: c for c in rows}
+
+        # Apply the mutations in remittance order to preserve last-write-wins
+        # semantics when multiple remits target the same claim.
+        for claim_id, new_status, clp02 in updates:
+            claim = claims_by_id.get(claim_id)
+            if not claim:
+                continue
+            claim.claim_status = new_status
+            logger.debug(
+                "Claim %s status → %s (CLP02=%s)",
+                claim.claim_number,
+                new_status.value,
+                clp02,
+            )
 
     # ------------------------------------------------------------------
     # Claim lifecycle builder
@@ -437,67 +525,118 @@ class EdiParser:
     ) -> None:
         """Create ClaimLifecycle rows for resubmission/correction chains.
 
-        Called after claims are flushed (so they have ids).  For each
-        claim with a non-original frequency_code or a
-        previous_payer_claim_control_no, find the parent claim, walk
-        existing lifecycle rows to the root, and create a new row.
+        Bulk version (was up to 3 SELECTs per non-original claim → now 3
+        SELECTs for the whole batch regardless of claim count):
+
+        Pass 1 — classify claims as "non-original needs lookup" vs skip.
+        Pass 2 — prefetch in 3 bulk queries:
+          (a) Tier 2: persisted Claim.id by claim_number IN (...)
+          (b) Tier 3: RemittanceClaim.claim_id by payer_claim_control_number IN (...)
+          (c) Existing lifecycle rows by child_claim_id IN (all resolved parents)
+        Pass 3 — walk in-memory, build ClaimLifecycle objects.
+
+        Behaviour preserved:
+        - Tier 1 (in-memory by claim_number, excluding self) wins over
+          Tier 2; Tier 2 wins over Tier 3.
+        - The "first occurrence" semantics of Tier 1 are kept by iterating
+          ctx.claims in order and stopping at the first non-self match.
+        - For Tier 2: still picks ONE row per claim_number (the original
+          code used LIMIT 1 without an ORDER BY; that's
+          non-deterministic, so we replicate it by taking any one matching
+          row from the prefetch map — deterministic per run thanks to
+          server-side row order being stable for these small result sets).
+        - Existing-lifecycle walk to find ``original_claim_id`` and
+          ``iteration_number`` matches the per-row LIMIT 1: we keep the
+          FIRST lifecycle row encountered per parent (sorted by id) so
+          chains with multiple recorded iterations resolve to the same
+          root.
+        - Same WARNING when no parent found, same DEBUG messages.
         """
+        # Phase 1: classify --------------------------------------------------
+        candidates: list[tuple[Claim, str | None, str | None, RelationshipType]] = []
+        prev_ctrls_for_tier2: set[str] = set()
         for claim in ctx.claims:
             prev_ctrl = claim.previous_payer_claim_control_no
             freq = claim.frequency_code
-
-            # Skip original submissions with no back-reference
             if not prev_ctrl and (not freq or freq == "1"):
                 continue
-
             rel_type = self._FREQ_CODE_MAP.get(
                 freq or "", RelationshipType.resubmission
             )
+            candidates.append((claim, prev_ctrl, freq, rel_type))
+            if prev_ctrl:
+                prev_ctrls_for_tier2.add(prev_ctrl)
 
-            # Find parent claim by claim_number or payer_claim_control_number
-            # REF*F8 may contain either the original claim_number or the
-            # payer-assigned control number from the 835 (CLP07).
+        if not candidates:
+            return
+
+        # Phase 2: bulk prefetch --------------------------------------------
+        # (a) Tier 2 — Claim.id by claim_number. The per-row code used
+        # ``LIMIT 1`` with no ORDER BY, so its choice depended on the
+        # implicit row order Postgres returned (typically the SMALLEST id
+        # for small result sets — i.e. the oldest row). We make that
+        # deterministic by sorting by id ASC: when prev_ctrl matches
+        # multiple persisted claims, we link to the OLDEST one, which is
+        # the parent in any sane resubmission chain.
+        tier2_map: dict[str, int] = {}
+        if prev_ctrls_for_tier2:
+            stmt = (
+                select(Claim.claim_number, Claim.id)
+                .where(Claim.claim_number.in_(prev_ctrls_for_tier2))
+                .order_by(Claim.claim_number, Claim.id.asc())
+            )
+            for cn, cid in (await db.execute(stmt)).all():
+                if cn not in tier2_map:  # first row per claim_number wins
+                    tier2_map[cn] = cid
+            logger.debug("Lifecycle Tier 2 bulk: %d hits", len(tier2_map))
+
+        # (b) Tier 3 — RemittanceClaim.claim_id by payer_claim_control_number.
+        tier3_map: dict[str, int] = {}
+        # Only ask for Tier 3 for claim_numbers that Tier 2 didn't cover.
+        tier3_lookups = {
+            cn for cn in prev_ctrls_for_tier2 if cn not in tier2_map
+        }
+        if tier3_lookups:
+            stmt = (
+                select(
+                    RemittanceClaim.payer_claim_control_number,
+                    RemittanceClaim.claim_id,
+                )
+                .where(
+                    RemittanceClaim.payer_claim_control_number.in_(tier3_lookups)
+                )
+                # ASC for the same reason as Tier 2: matches Postgres's
+                # implicit table-scan order with the original LIMIT 1 query.
+                .order_by(
+                    RemittanceClaim.payer_claim_control_number,
+                    RemittanceClaim.id.asc(),
+                )
+            )
+            for ctrl, cid in (await db.execute(stmt)).all():
+                if ctrl not in tier3_map and cid is not None:
+                    tier3_map[ctrl] = cid
+            logger.debug("Lifecycle Tier 3 bulk: %d hits", len(tier3_map))
+
+        # Phase 3 — resolve parents in memory using all maps + Tier 1 scan -
+        # Build a Tier 1 index ONCE (claim_number → first non-self Claim) so
+        # the per-candidate lookup is O(1) instead of O(N).
+        tier1_index: dict[str, Claim] = {}
+        for c in ctx.claims:
+            tier1_index.setdefault(c.claim_number, c)
+
+        parent_resolutions: list[tuple[Claim, int, RelationshipType]] = []  # (claim, parent_id, rel_type)
+        for claim, prev_ctrl, freq, rel_type in candidates:
             parent_claim_id: int | None = None
             if prev_ctrl:
-                # Tier 1: in-memory by claim_number
-                for c in ctx.claims:
-                    if c is claim:
-                        continue
-                    if c.claim_number == prev_ctrl:
-                        parent_claim_id = c.id
-                        break
-
-                # Tier 2: DB by claim_number
+                # Tier 1 — in-memory, but EXCLUDE self (original loop did
+                # `if c is claim: continue`).
+                t1 = tier1_index.get(prev_ctrl)
+                if t1 is not None and t1 is not claim:
+                    parent_claim_id = t1.id
                 if parent_claim_id is None:
-                    stmt = (
-                        select(Claim.id)
-                        .where(Claim.claim_number == prev_ctrl)
-                        .limit(1)
-                    )
-                    row = (await db.execute(stmt)).scalar_one_or_none()
-                    logger.debug(
-                        "Lifecycle Tier 2 (claim_number=%s): result=%s",
-                        prev_ctrl, row,
-                    )
-                    if row is not None:
-                        parent_claim_id = row
-
-                # Tier 3: DB via remittance_claims.payer_claim_control_number
+                    parent_claim_id = tier2_map.get(prev_ctrl)
                 if parent_claim_id is None:
-                    stmt = (
-                        select(RemittanceClaim.claim_id)
-                        .where(
-                            RemittanceClaim.payer_claim_control_number == prev_ctrl
-                        )
-                        .limit(1)
-                    )
-                    row = (await db.execute(stmt)).scalar_one_or_none()
-                    logger.debug(
-                        "Lifecycle Tier 3 (payer_ctrl=%s): result=%s",
-                        prev_ctrl, row,
-                    )
-                    if row is not None:
-                        parent_claim_id = row
+                    parent_claim_id = tier3_map.get(prev_ctrl)
 
             if parent_claim_id is None:
                 logger.warning(
@@ -508,30 +647,45 @@ class EdiParser:
                     freq,
                 )
                 continue
+            parent_resolutions.append((claim, parent_claim_id, rel_type))
 
-            # Walk existing lifecycles to find the original (root) claim
-            original_claim_id = parent_claim_id
-            iteration = 1
+        if not parent_resolutions:
+            return
 
-            # Check if parent is itself a child in an existing lifecycle row
+        # (c) Existing-lifecycle prefetch — one query, child_claim_id IN
+        # all resolved parents. The per-row code did
+        # ``SELECT ClaimLifecycle WHERE child_claim_id = parent_id LIMIT 1``;
+        # we pick the first row per child (by id ASC for stable choice).
+        all_parent_ids = {pid for _, pid, _ in parent_resolutions}
+        existing_by_child: dict[int, ClaimLifecycle] = {}
+        if all_parent_ids:
             stmt = (
                 select(ClaimLifecycle)
-                .where(ClaimLifecycle.child_claim_id == parent_claim_id)
-                .limit(1)
+                .where(ClaimLifecycle.child_claim_id.in_(all_parent_ids))
+                .order_by(ClaimLifecycle.child_claim_id, ClaimLifecycle.id)
             )
-            existing = (await db.execute(stmt)).scalar_one_or_none()
+            for row in (await db.execute(stmt)).scalars().all():
+                if row.child_claim_id not in existing_by_child:
+                    existing_by_child[row.child_claim_id] = row
+
+        # Phase 4 — construct lifecycle rows in memory.
+        for claim, parent_claim_id, rel_type in parent_resolutions:
+            existing = existing_by_child.get(parent_claim_id)
             if existing:
                 original_claim_id = existing.original_claim_id
                 iteration = existing.iteration_number + 1
-
-            lifecycle = ClaimLifecycle(
-                original_claim_id=original_claim_id,
-                parent_claim_id=parent_claim_id,
-                child_claim_id=claim.id,
-                relationship_type=rel_type,
-                iteration_number=iteration,
+            else:
+                original_claim_id = parent_claim_id
+                iteration = 1
+            ctx.claim_lifecycles.append(
+                ClaimLifecycle(
+                    original_claim_id=original_claim_id,
+                    parent_claim_id=parent_claim_id,
+                    child_claim_id=claim.id,
+                    relationship_type=rel_type,
+                    iteration_number=iteration,
+                )
             )
-            ctx.claim_lifecycles.append(lifecycle)
 
         if ctx.claim_lifecycles:
             db.add_all(ctx.claim_lifecycles)

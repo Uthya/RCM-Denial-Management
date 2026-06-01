@@ -206,6 +206,9 @@ class ParseContext:
     current_patient_member_id: str | None = None
     current_service_date: date | None = None
     current_remittance_date: date | None = None
+    # NM1*85 (billing provider) typically precedes the CLM segment in 837P
+    # loop order (2010AA → 2300). Park it here so CLM can stamp the claim.
+    current_billing_provider_npi: str | None = None
 
     # Accumulators
     claims: list[Claim] = field(default_factory=list)

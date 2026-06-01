@@ -21,6 +21,10 @@ class ClaimCreate(SchemaBase):
     edi_file_id: int | None = None
     raw_claim_segment: str | None = None
     previous_payer_claim_control_no: str | None = None
+    authorization_number: str | None = None
+    referral_number: str | None = None
+    billing_provider_npi: str | None = None
+    rendering_provider_npi: str | None = None
 
 
 class ClaimResponse(SchemaBase):
@@ -36,6 +40,10 @@ class ClaimResponse(SchemaBase):
     claim_status: ClaimStatus
     edi_file_id: int | None = None
     previous_payer_claim_control_no: str | None = None
+    authorization_number: str | None = None
+    referral_number: str | None = None
+    billing_provider_npi: str | None = None
+    rendering_provider_npi: str | None = None
     created_at: datetime
     updated_at: datetime
 

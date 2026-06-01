@@ -286,20 +286,54 @@ async def _recommendations_for_837(
         predictor = None
         predictor_ready = False
 
+    # Batched prediction: same anti-pattern that /predict-file already
+    # eliminated. One predict_batch() call for the whole file instead of
+    # N predict() calls. Per-claim outputs are byte-identical (covered by
+    # tests/test_predictor_batch.py).
+    #
+    # On batch-level failure (FE/model/calibrator broken), every claim
+    # gets risk_level=None — the SAME end-state the per-row version
+    # arrived at if every single predict() call raised. Per-claim
+    # isolation is therefore preserved at the user-visible behaviour
+    # level (no claim becomes accidentally flagged because of a sibling
+    # claim's failure).
+    preds_by_claim_id: dict[int, dict] = {}
+    if predictor_ready and claims:
+        try:
+            pred_inputs = [_claim_to_predict_dict(c) for c in claims]
+            preds = predictor.predict_batch(pred_inputs)
+            preds_by_claim_id = {
+                claim.id: pred for claim, pred in zip(claims, preds, strict=True)
+            }
+        except Exception:
+            logger.exception(
+                "Batched prediction failed for recommendations on edi_file_id=%s "
+                "(%d claims); proceeding with no ML signal",
+                edi.id,
+                len(claims),
+            )
+            preds_by_claim_id = {}
+
     flagged: list[ClaimRecommendation] = []
     for claim in claims:
         risk_score: float | None = None
         risk_level: str | None = None
         ml_factors: list[dict] = []
 
-        if predictor_ready:
+        pred = preds_by_claim_id.get(claim.id)
+        if pred is not None:
             try:
-                pred = predictor.predict(_claim_to_predict_dict(claim))
                 risk_score = float(pred["risk_score"])
                 risk_level = pred["risk_level"]
                 ml_factors = pred.get("top_risk_factors") or []
-            except Exception:
-                logger.exception("Prediction failed for claim %s", claim.claim_number)
+            except (KeyError, TypeError, ValueError):
+                # Defensive: a malformed prediction dict for one claim
+                # must not poison the rest. Same per-claim isolation as
+                # the previous per-row try/except.
+                logger.exception(
+                    "Malformed prediction payload for claim %s",
+                    claim.claim_number,
+                )
 
         badge = _badge_for_837_claim(risk_level)
         # Surface only HIGH-risk claims in the 837 panel

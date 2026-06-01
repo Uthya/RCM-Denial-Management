@@ -21,10 +21,18 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-FEATURE_ENGINEERING_VERSION = "v4"
+FEATURE_ENGINEERING_VERSION = "v5"
 # v3 -> v4: explicit unseen-category indicators (payer/CPT/Dx/any) and a
 # persisted training-time category vocabulary, so inference can distinguish
 # "category never seen in training" from "category seen but never denied."
+# v4 -> v5: surface authorization/referral presence, provider-NPI target
+# encoding (with their own unseen-* flags), and a service-to-submission day
+# delta. Adds 7 new features (34 -> 41). All new categorical sources go
+# through the same leakage-safe per-fold TargetEncoder used in v3+; the new
+# vocabulary entries piggyback on the unseen-flag machinery introduced in
+# v4. Submission date is sourced from ``claim.created_at`` (set when the
+# 837 is ingested), which strictly precedes any 835/denial outcome — no
+# future-information leakage is possible.
 
 # Sentinel string used when stringifying nullable categorical values for joint
 # keys. Keeps the joint cardinality meaningful (e.g. "ACME||missing") instead
@@ -74,6 +82,12 @@ _CATEGORICAL_COLUMNS: list[str] = [
     "primary_procedure_code",
     "primary_diagnosis_code",
     "place_of_service",
+    # v5: provider NPIs run through the same leakage-safe per-fold
+    # TargetEncoder as payer/CPT/Dx. High-cardinality but well-behaved with
+    # 5-fold target encoding + smoothing — exactly the same regime that
+    # tames primary_procedure_code's ~5–10k unique values.
+    "billing_provider_npi",
+    "rendering_provider_npi",
 ]
 
 _MISSINGNESS_SOURCES: dict[str, str] = {
@@ -128,6 +142,14 @@ FEATURE_COLUMNS: list[str] = [
     "unseen_cpt",
     "unseen_dx",
     "unseen_any",
+    # v5 additions — authorization, provider, and timely-filing signals.
+    "has_prior_authorization",
+    "has_referral",
+    "billing_provider_npi_encoded",
+    "rendering_provider_npi_encoded",
+    "unseen_billing_provider",
+    "unseen_rendering_provider",
+    "service_to_submission_days",
 ]
 
 
@@ -180,7 +202,15 @@ _FEATURE_METADATA: list[FeatureMeta] = [
     FeatureMeta("unseen_payer", "int64", "payer_name", "value not in training-time vocabulary"),
     FeatureMeta("unseen_cpt", "int64", "primary_procedure_code", "value not in training-time vocabulary"),
     FeatureMeta("unseen_dx", "int64", "primary_diagnosis_code", "value not in training-time vocabulary"),
-    FeatureMeta("unseen_any", "int64", "payer/cpt/dx", "any of unseen_payer/cpt/dx is 1"),
+    FeatureMeta("unseen_any", "int64", "payer/cpt/dx/billing/rendering", "any of unseen_* is 1"),
+    # v5 additions
+    FeatureMeta("has_prior_authorization", "int64", "authorization_number", "is not null/blank"),
+    FeatureMeta("has_referral", "int64", "referral_number", "is not null/blank"),
+    FeatureMeta("billing_provider_npi_encoded", "float64", "billing_provider_npi", "TargetEncoder"),
+    FeatureMeta("rendering_provider_npi_encoded", "float64", "rendering_provider_npi", "TargetEncoder"),
+    FeatureMeta("unseen_billing_provider", "int64", "billing_provider_npi", "value not in training-time vocabulary"),
+    FeatureMeta("unseen_rendering_provider", "int64", "rendering_provider_npi", "value not in training-time vocabulary"),
+    FeatureMeta("service_to_submission_days", "int64", "submission_date / service_from_date", "date diff (days), clipped >=0, 0 if null"),
 ]
 
 
@@ -202,6 +232,44 @@ def _compute_service_duration(
     to_dt = pd.to_datetime(to_dates, errors="coerce")
     delta = (to_dt - from_dt).dt.days
     return delta.fillna(0).clip(lower=0).astype("int64")
+
+
+def _compute_submission_lag(
+    submission_dates: pd.Series | None,
+    service_from_dates: pd.Series,
+) -> pd.Series:
+    """Return integer days between service start and submission timestamp.
+
+    - Missing submission_date -> 0 (the feature is benignly off rather than
+      faking a value; the predict API doesn't always have a meaningful
+      submission timestamp).
+    - Missing service_from_date -> 0
+    - Negative durations clipped to 0 (would only happen if a clock-skewed
+      837 was filed *before* the date of service; treated as zero lag).
+    """
+    if submission_dates is None:
+        return pd.Series(0, index=service_from_dates.index, dtype="int64")
+    sub_dt = pd.to_datetime(submission_dates, errors="coerce")
+    serv_dt = pd.to_datetime(service_from_dates, errors="coerce")
+    delta = (sub_dt - serv_dt).dt.days
+    return delta.fillna(0).clip(lower=0).astype("int64")
+
+
+def _is_present(df: pd.DataFrame, column: str) -> pd.Series:
+    """Return a 0/1 mask: 1 when the value is non-null and non-blank.
+
+    Used by ``has_prior_authorization`` / ``has_referral`` — these features
+    measure *presence* of the REF segment, not its content. Treats whitespace
+    strings the same as null so a stray "  " in the source doesn't fake
+    presence. A missing column on the input frame is treated as universally
+    absent (returns an all-zero series aligned to ``df.index``) so callers
+    not yet supplying the v5 columns degrade gracefully.
+    """
+    if column not in df.columns:
+        return pd.Series(0, index=df.index, dtype="int64")
+    series = df[column]
+    s = series.astype(object).where(series.notna(), other=None)
+    return s.map(lambda v: int(bool(v) and str(v).strip() != ""))
 
 
 def _validate_features(df: pd.DataFrame) -> None:
@@ -269,13 +337,23 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         "unseen_cpt",
         "unseen_dx",
         "unseen_any",
+        # v5
+        "has_prior_authorization",
+        "has_referral",
+        "unseen_billing_provider",
+        "unseen_rendering_provider",
+        "service_to_submission_days",
     ]
 
     # Source columns whose vocabularies we persist for the unseen-* flags.
+    # v5: provider NPIs join payer/CPT/Dx — same OOV semantics. Order matters
+    # only for the deterministic compute of ``unseen_any`` below.
     _VOCABULARY_COLUMNS: ClassVar[dict[str, str]] = {
         "unseen_payer": "payer_name",
         "unseen_cpt": "primary_procedure_code",
         "unseen_dx": "primary_diagnosis_code",
+        "unseen_billing_provider": "billing_provider_npi",
+        "unseen_rendering_provider": "rendering_provider_npi",
     }
 
     def __init__(self) -> None:
@@ -348,6 +426,27 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         for feat_name, src_col in _MISSINGNESS_SOURCES.items():
             out[feat_name] = df[src_col].isna().astype(int)
 
+        # v5: authorization / referral presence flags. Both are derived from
+        # 837 REF segments captured in the parser (REF*G1/G3, REF*9F). A
+        # claim with an authorization_number is far less likely to deny on
+        # CARC 15/197/198; the boolean form is robust to spurious whitespace
+        # or sentinel values in the underlying string.
+        out["has_prior_authorization"] = _is_present(df, "authorization_number").astype("int64")
+        out["has_referral"] = _is_present(df, "referral_number").astype("int64")
+
+        # v5: service-to-submission day delta. submission_date is set by the
+        # dataset loader from ``claim.created_at`` (the ingestion timestamp);
+        # at inference the caller passes ``date.today()`` (or omits it, in
+        # which case the feature falls to 0). Negative values clipped to 0 —
+        # a submission_date before service_from_date would be a parser/clock
+        # bug, not a real timely-filing signal.
+        submission_dates = (
+            df["submission_date"] if "submission_date" in df.columns else None
+        )
+        out["service_to_submission_days"] = _compute_submission_lag(
+            submission_dates, df["service_from_date"]
+        )
+
         # Enforce column order
         out = out[FEATURE_COLUMNS]
 
@@ -377,10 +476,18 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         inference with nullable categoricals deterministic; the dedicated
         ``missing_*`` flag features still carry the missingness signal
         explicitly to the model.
+
+        A categorical source column that is absent from the input frame is
+        synthesized as all-missing rather than raising — keeps the predict
+        API backward-compatible for callers that haven't yet started passing
+        v5 fields like ``billing_provider_npi``.
         """
-        cat_df = df[_CATEGORICAL_COLUMNS].copy()
+        cat_df = pd.DataFrame(index=df.index)
         for col in _CATEGORICAL_COLUMNS:
-            cat_df[col] = self._stringify(cat_df[col])
+            if col in df.columns:
+                cat_df[col] = self._stringify(df[col])
+            else:
+                cat_df[col] = _MISSING_SENTINEL
         return cat_df
 
     @staticmethod
@@ -390,11 +497,21 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         Used when constructing joint keys — null values must collapse to a
         consistent token so e.g. ``"ACME||{missing}"`` is one category, not a
         scattered set of distinct keys.
+
+        Implementation note: ``Series.astype(str)`` on a column containing
+        ``None`` can yield a **float** ``NaN`` (not the string ``"nan"``)
+        depending on the input dtype, which then slips past
+        ``Series.replace("nan", ...)``. Filling nulls *before* casting
+        guarantees the sentinel survives, regardless of the source dtype.
+        Also coerces ``"nan"`` / ``"None"`` / ``"<NA>"`` string artifacts
+        defensively in case the data already round-tripped through a CSV.
         """
+        filled = series.where(series.notna(), other=_MISSING_SENTINEL)
         return (
-            series.astype(str)
+            filled.astype(str)
             .replace("nan", _MISSING_SENTINEL)
             .replace("None", _MISSING_SENTINEL)
+            .replace("<NA>", _MISSING_SENTINEL)
         )
 
     def _build_joint_input(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -418,31 +535,50 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
     ) -> dict[str, frozenset[str]]:
         """Snapshot the set of distinct non-missing categorical values per source
         column. Missing values are EXCLUDED so they're handled by the missing_*
-        flags, not conflated with unseen-at-training.
+        flags, not conflated with unseen-at-training. A source column missing
+        from the training frame produces an empty vocabulary (so every value
+        seen at inference flags as unseen, surfacing the schema mismatch
+        clearly rather than masking it).
         """
         vocab: dict[str, frozenset[str]] = {}
         for src_col in self._VOCABULARY_COLUMNS.values():
+            if src_col not in df.columns:
+                vocab[src_col] = frozenset()
+                continue
             stringified = self._stringify(df[src_col])
             values = {v for v in stringified.unique() if v != _MISSING_SENTINEL}
             vocab[src_col] = frozenset(values)
         return vocab
 
     def _apply_unseen_flags(self, out: pd.DataFrame, df: pd.DataFrame) -> None:
-        """Append unseen_payer / unseen_cpt / unseen_dx / unseen_any flags.
+        """Append unseen_* flags + unseen_any.
 
         ``unseen_X`` is 1 when the row's value for source column X is non-missing
         AND wasn't in the training-time vocabulary. Missing values are NOT
-        flagged unseen (they're covered by missing_X), so the two signals stay
-        independent.
+        flagged unseen (they're covered by missing_X or, for v5 columns,
+        by the has_prior_authorization / has_referral flags), so the two
+        signals stay independent.
+
+        v5: extended to cover billing_provider_npi and rendering_provider_npi.
+        ``unseen_any`` is the OR across all five tracked dimensions.
+
+        A source column missing entirely from the input frame is treated as
+        all-missing (flag = 0 for every row). This keeps backward
+        compatibility with callers that don't yet supply the v5 fields and
+        avoids spurious "unseen" badges that the operator can't act on.
         """
         assert self.category_vocabularies_ is not None, "vocabularies must be fitted"
         unseen_any = pd.Series(0, index=df.index, dtype="int64")
         for feat_name, src_col in self._VOCABULARY_COLUMNS.items():
-            stringified = self._stringify(df[src_col])
-            seen = self.category_vocabularies_.get(src_col, frozenset())
-            # value is unseen if it's not missing AND not in the seen vocab.
-            mask = (stringified != _MISSING_SENTINEL) & (~stringified.isin(seen))
-            flag = mask.astype("int64")
+            if src_col in df.columns:
+                stringified = self._stringify(df[src_col])
+                seen = self.category_vocabularies_.get(src_col, frozenset())
+                # value is unseen if it's not missing AND not in the seen vocab.
+                mask = (stringified != _MISSING_SENTINEL) & (~stringified.isin(seen))
+                flag = mask.astype("int64")
+            else:
+                # Source column absent — treat as universally missing.
+                flag = pd.Series(0, index=df.index, dtype="int64")
             out[feat_name] = flag
             unseen_any = (unseen_any | flag).astype("int64")
         out["unseen_any"] = unseen_any

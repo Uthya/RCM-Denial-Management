@@ -11,6 +11,130 @@ Conventions:
 
 ---
 
+## v3.5 — Authorization / referral / provider-NPI / submission-lag features (FE v4 → v5)
+
+**Date:** 2026-06-01 · **Status:** deployed (current)
+
+**Trigger:** Feature audit identified five denial categories the model could not learn from existing data:
+- CARC 15 / 95 / 197 / 198 — prior authorization absent or exceeded
+- CARC 165 — referral missing
+- CARC 38 / 170 / 185 / 242 — provider type / credentialing
+- CARC 29 — timely-filing deadline missed
+- CARC 110 — billing date predates service date
+
+All of the required raw inputs were *already in the 837 stream* — they just weren't being captured by the parser or exposed to the feature engineer.
+
+**Changes from v3.4:**
+
+1. **Schema (Alembic `a1b2c3d4e5f6`).** Four nullable columns added to `claims`:
+   `authorization_number`, `referral_number`, `billing_provider_npi`,
+   `rendering_provider_npi`. Two indices on the NPI columns for per-fold
+   target-encoding scans and OOV roll-up queries. Existing rows untouched —
+   new columns are all `NULL` (which itself carries signal via the new
+   presence flags).
+
+2. **Parser (`services/parsers/handlers.py`).**
+   - `handle_ref` extended to capture **REF*G1** / **REF*G3** (prior auth /
+     predetermination) → `authorization_number`; **REF*9F** (referral) →
+     `referral_number`.
+   - `handle_nm1` extended to capture **NM1*85** (billing provider, Loop
+     2010AA) and **NM1*82** (rendering provider, Loop 2310B), accepting the
+     NPI from element 9 only when element 8's qualifier is `XX`. Other ID
+     types (e.g. EIN with qualifier `24`) are explicitly rejected so the
+     target encoder isn't poisoned with mixed identifier kinds.
+   - Billing NPI is buffered on `ParseContext.current_billing_provider_npi`
+     and consumed at CLM time (spec loop order places NM1*85 before CLM).
+
+3. **Feature engineering bumped v4 → v5** (`app/ml/feature_engineering.py`).
+   Seven new output features (35 → 42):
+   - `has_prior_authorization` (boolean: REF*G1/G3 present + non-blank)
+   - `has_referral`            (boolean: REF*9F present + non-blank)
+   - `billing_provider_npi_encoded`     (TargetEncoder, 5-fold CV, leakage-safe)
+   - `rendering_provider_npi_encoded`   (TargetEncoder, 5-fold CV, leakage-safe)
+   - `unseen_billing_provider`          (1 if NPI not in training vocab)
+   - `unseen_rendering_provider`        (1 if NPI not in training vocab)
+   - `service_to_submission_days`       (int days, clipped >=0, 0 if null)
+
+   The two NPI columns join `_CATEGORICAL_COLUMNS` so they ride the same
+   per-fold-refit TargetEncoder regime as payer / CPT / Dx — no new
+   leakage surface. Both NPI columns also join `_VOCABULARY_COLUMNS`, so
+   the v4 unseen-flag machinery extends to providers, and `unseen_any`
+   is now the OR across all five tracked dimensions (payer + CPT + Dx +
+   billing-NPI + rendering-NPI).
+
+4. **Submission-date sourcing.** `app.ml.dataset.build_dataset` reads
+   `claim.created_at` (the TimestampMixin column populated when the 837 is
+   ingested) as the submission timestamp. This is strictly before any
+   835/denial outcome by construction → **no future-information leakage**.
+   At inference, the predictor router passes the claim's `created_at` for
+   stored claims, or `date.today()` for ad-hoc `/predict` calls.
+
+5. **Defensive engineer changes.** `_prepare_categorical_input`,
+   `_apply_unseen_flags`, and `_compute_category_vocabularies` now treat
+   a source column missing from the input frame as "all-missing" rather
+   than raising. Keeps the v5 engineer compatible with v4-shape callers
+   that haven't been updated. Also fixes a pre-existing latent bug in
+   `_stringify` where `None.astype(str)` yielded a float `NaN` (not the
+   string `"nan"`) under pandas 2.x, which previously slipped past the
+   sentinel replacement.
+
+6. **Monitoring surfaces.**
+   - `FEATURE_DISPLAY_NAMES` and `ML_FEATURE_HINTS` gained entries for
+     all 7 new features (e.g. "Prior Authorization Present" → CARC 198
+     hint; "New Billing Provider (no training history)" → credentialing
+     advice).
+   - `PredictionResponse.unseen_indicators` extended with optional
+     `billing_provider` and `rendering_provider` fields (additive — older
+     clients keep working).
+   - `_SNAPSHOT_FIELDS` in `prediction_logger.py` extended so the v5
+     inputs land in `prediction_log.feature_snapshot` and the
+     `/unseen-rate` endpoint can roll up provider OOV.
+   - `_UNSEEN_DIMENSIONS` in `routers/monitoring.py` extended with
+     `billing_provider` / `rendering_provider` keys.
+   - `distributions.py` bumped v1 → v2: provider NPIs added to the
+     categorical PSI baseline, `service_to_submission_days` added to the
+     continuous baseline, four new missingness sources tracked.
+
+7. **MODEL_VERSION v3.4 → v3.5**, **FEATURE_VERSION v4 → v5**. Strict-fail
+   loading still rejects mismatched artifacts, so a v3.4 model paired with
+   v3.5 code refuses to serve.
+
+**Expected impact (qualitative — empirical re-train pending on production data):**
+
+| CARC category | Previously unlearnable | v5 surface |
+|---|---|---|
+| 15 / 95 / 197 / 198 (auth) | yes | `has_prior_authorization` |
+| 165 (referral) | yes | `has_referral` |
+| 38 / 170 / 185 / 242 (provider) | yes | `billing_provider_npi_encoded`, `rendering_provider_npi_encoded`, unseen-* flags |
+| 29 / 110 / 146 (timely-filing / DOS) | yes | `service_to_submission_days` |
+
+**Pros:** Five previously-blind denial categories now surface as direct
+model features; provider-NPI OOV gets the same early-warning treatment as
+new payers; submission-lag is computed from a strictly-pre-adjudication
+timestamp (`claim.created_at`), so the timely-filing signal cannot leak;
+all changes are backward-compatible with v4 input shape (defensive engineer
+handles missing source columns by treating them as universally absent —
+the existing 837 corpus continues to flow through the engineer unchanged).
+
+**Cons:** Feature count grew (+7 columns, 35 → 42) and `n_features_in_`
+permanently differs from v3.x / v4 — *no compatibility path back without a
+code rollback*. The v5 features are most informative only on freshly-ingested
+837s that include the new segments; the historic corpus parsed under
+pre-v3.5 code carries all-NULL NPI / auth / referral columns and will
+contribute only `service_to_submission_days` and the (zero) presence
+flags until those claims are re-parsed.
+
+**Tests (`tests/test_feature_engineering.py`):** 12 existing tests still
+pass; 8 new tests added covering feature count (42), auth/referral flag
+correctness, provider OOV flag orthogonality with missing values,
+submission-lag arithmetic + clipping, backward-compatibility with v4
+input shape, and a leakage probe confirming the deployment encoder produces
+identical submission-lag features regardless of label presence. Smoke
+test on a synthetic 837 carrying REF*G1, REF*9F, NM1*85, NM1*82 confirms
+end-to-end capture into the Claim row.
+
+---
+
 ## v3.4 — Training-pipeline optimizations (no scoring change; 155 s → 100 s full / 62 s warm)
 
 **Date:** 2026-05-28 · **Status:** infra-only; v3.4 model unchanged

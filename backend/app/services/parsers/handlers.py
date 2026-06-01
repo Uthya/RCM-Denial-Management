@@ -89,6 +89,11 @@ def handle_clm(
         service_from_date=date.today(),  # placeholder, overridden by DTP*472
         claim_status=ClaimStatus.submitted,
         raw_claim_segment=raw_text,
+        # Billing provider is set at the submitter level (Loop 2010AA, NM1*85),
+        # which precedes CLM in spec order — pull it from context. Rendering
+        # provider (NM1*82) appears after CLM in Loop 2310B and is stamped on
+        # the claim directly by handle_nm1.
+        billing_provider_npi=ctx.current_billing_provider_npi,
     )
 
     # Reset per-claim state
@@ -347,6 +352,44 @@ def handle_nm1(
                 "NM1*QC member_id=%s pos=%d", member_id, ctx.segment_position
             )
 
+    elif qualifier == "85":  # Billing provider (Loop 2010AA)
+        # NM1*85*2*BILLING NAME****XX*1234567890
+        # element 8 is the ID qualifier ("XX" for NPI), element 9 is the NPI.
+        # Some 837s use other qualifiers (24=EIN) — only capture XX so the
+        # column is consistently a 10-digit NPI and the target encoder isn't
+        # poisoned with mixed identifier types.
+        id_qualifier = safe_element(elements, 8)
+        provider_id = safe_element(elements, 9)
+        if provider_id and id_qualifier == "XX":
+            # Park on the context until CLM creates a claim. NM1*85 typically
+            # appears BEFORE CLM in 837P loop order (2010AA precedes 2300), so
+            # capture it on ctx and let CLM consume.
+            ctx.current_billing_provider_npi = provider_id
+            # Also stamp the active claim if NM1*85 lands mid-claim (rare but
+            # spec-permitted via 2310 loops); the CLM-time capture below covers
+            # the standard case.
+            if ctx.current_claim is not None:
+                ctx.current_claim.billing_provider_npi = provider_id
+            logger.debug(
+                "NM1*85 billing_provider_npi=%s pos=%d",
+                provider_id,
+                ctx.segment_position,
+            )
+
+    elif qualifier == "82":  # Rendering provider (Loop 2310B)
+        # NM1*82*1*LAST*FIRST****XX*1234567890
+        id_qualifier = safe_element(elements, 8)
+        provider_id = safe_element(elements, 9)
+        if provider_id and id_qualifier == "XX":
+            # Rendering provider is scoped to the current claim's encounter.
+            if ctx.current_claim is not None:
+                ctx.current_claim.rendering_provider_npi = provider_id
+            logger.debug(
+                "NM1*82 rendering_provider_npi=%s pos=%d",
+                provider_id,
+                ctx.segment_position,
+            )
+
 
 # ---------------------------------------------------------------------------
 # REF — reference identification
@@ -370,6 +413,32 @@ def handle_ref(
     elif qualifier == "F8" and value and ctx.current_claim:
         ctx.current_claim.previous_payer_claim_control_no = value
         logger.debug("REF*F8 prev_payer_ctrl=%s pos=%d", value, ctx.segment_position)
+
+    # REF*G1 / REF*G3 = prior authorization / predetermination of benefits.
+    # Either qualifier predicts authorization-driven denial categories
+    # (CARC 15, 95, 197, 198) — captured into a single column.
+    elif qualifier in ("G1", "G3") and value and ctx.current_claim:
+        # First wins: a claim with both G1 and G3 keeps the auth number from
+        # whichever segment appeared first; both still encode the same
+        # has_prior_authorization feature later.
+        if not ctx.current_claim.authorization_number:
+            ctx.current_claim.authorization_number = value
+        logger.debug(
+            "REF*%s authorization_number=%s pos=%d",
+            qualifier,
+            value,
+            ctx.segment_position,
+        )
+
+    # REF*9F = referral number (Loop 2300). Predicts CARC 165 (referral
+    # absent / exceeded) and the broader CARC 38/242 PCP-routing denials.
+    elif qualifier == "9F" and value and ctx.current_claim:
+        ctx.current_claim.referral_number = value
+        logger.debug(
+            "REF*9F referral_number=%s pos=%d",
+            value,
+            ctx.segment_position,
+        )
 
 
 # ---------------------------------------------------------------------------

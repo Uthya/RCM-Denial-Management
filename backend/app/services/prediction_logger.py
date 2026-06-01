@@ -35,6 +35,14 @@ _SNAPSHOT_FIELDS: tuple[str, ...] = (
     "has_modifier",
     "service_from_date",
     "service_to_date",
+    # v5 — captured so the monitoring endpoints can roll up OOV rates over
+    # billing/rendering NPIs and surface auth/referral presence trends
+    # without needing to re-join to the source claim rows.
+    "authorization_number",
+    "referral_number",
+    "billing_provider_npi",
+    "rendering_provider_npi",
+    "submission_date",
 )
 
 

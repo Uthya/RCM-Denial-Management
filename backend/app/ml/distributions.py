@@ -23,7 +23,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-DISTRIBUTIONS_VERSION = "v1"
+DISTRIBUTIONS_VERSION = "v2"
+# v1 -> v2: provider NPI categoricals and service-to-submission day quantiles
+# added to the snapshot so the drift monitor sees them. Backward-compatible:
+# older snapshots without these keys simply get an empty drift entry, not
+# an exception.
 
 # Top-N values to keep per categorical column. The long tail is summarised
 # in a single "__other__" bucket so PSI calculations stay stable when new
@@ -34,6 +38,9 @@ _TOP_N_DX = 100
 _TOP_N_POS = 20
 _TOP_N_FACILITY = 20
 _TOP_N_FREQ = 10
+# Providers are usually a 10-200 distinct-NPI tail per practice; keep 200
+# to retain the heavy hitters and fold the rest into __other__.
+_TOP_N_PROVIDER = 200
 
 _OTHER_KEY = "__other__"
 _MISSING_KEY = "__missing__"
@@ -154,6 +161,16 @@ def build_distribution_snapshot(
                 raw_df.get("frequency_code", pd.Series(dtype=object)),
                 _TOP_N_FREQ,
             ),
+            # v5: provider NPIs go through the same PSI/unseen-rate machinery
+            # as payer / CPT / Dx.
+            "billing_provider_npi": _category_frequencies(
+                raw_df.get("billing_provider_npi", pd.Series(dtype=object)),
+                _TOP_N_PROVIDER,
+            ),
+            "rendering_provider_npi": _category_frequencies(
+                raw_df.get("rendering_provider_npi", pd.Series(dtype=object)),
+                _TOP_N_PROVIDER,
+            ),
         },
         "continuous": {
             "total_charge_amount": _continuous_summary(
@@ -171,6 +188,12 @@ def build_distribution_snapshot(
             "diagnosis_count": _continuous_summary(
                 raw_df.get("diagnosis_count", pd.Series(dtype=float))
             ),
+            # v5: timely-filing distribution from the engineered feature.
+            "service_to_submission_days": _continuous_summary(
+                feature_df.get(
+                    "service_to_submission_days", pd.Series(dtype=float)
+                )
+            ),
         },
         "missingness": _missingness_rates(
             raw_df,
@@ -180,6 +203,13 @@ def build_distribution_snapshot(
                 "primary_diagnosis_code",
                 "place_of_service",
                 "facility_type_code",
+                # v5: missingness here is itself signal (no auth / referral
+                # / NPI on a real claim correlates with denials), so it goes
+                # in structural-drift not operational-drift.
+                "authorization_number",
+                "referral_number",
+                "billing_provider_npi",
+                "rendering_provider_npi",
             ],
         ),
         "rare_flags": {
