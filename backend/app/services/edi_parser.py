@@ -8,13 +8,18 @@ from __future__ import annotations
 import logging
 from datetime import date as date_cls
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.adjustment import Adjustment
 from app.models.claim import Claim
 from app.models.claim_lifecycle import ClaimLifecycle
+from app.models.claim_line import ClaimLine
+from app.models.diagnosis import Diagnosis
 from app.models.edi_file import EdiFile
 from app.models.enums import ClaimStatus, FileType, RelationshipType
+from app.models.raw_segment import RawSegment
+from app.models.remark_code import RemarkCode
 from app.models.remittance_claim import RemittanceClaim
 from app.services.parsers.base import (
     Delimiters,
@@ -277,7 +282,8 @@ class EdiParser:
             # 2b. Claim lifecycles → link resubmission/correction chains
             await self._build_claim_lifecycles(ctx, db)
 
-            # 3. ClaimLines + Diagnoses → resolve claim_id via tagged ref
+            # 3. ClaimLines + Diagnoses → resolve claim_id via tagged ref,
+            #    then bulk-INSERT via Core (no IDs needed back to Python).
             for line in ctx.claim_lines:
                 ref = getattr(line, "_parse_claim_ref", None)
                 if ref is not None:
@@ -287,16 +293,50 @@ class EdiParser:
                 if ref is not None:
                     diag.claim_id = ref.id
 
-            db.add_all(ctx.claim_lines)
-            db.add_all(ctx.diagnoses)
-            await db.flush()
+            # SQLAlchemy 2.x Core multi-row INSERT: ONE statement per table,
+            # all rows packed into a single ``VALUES (...), (...), ...``
+            # clause via ``.values(list_of_dicts)``. This is critical over
+            # a high-latency WAN — the alternative API
+            # ``db.execute(insert(M), [list])`` looks similar but routes
+            # through asyncpg's ``executemany`` which serializes one
+            # round-trip per row (1000 rows × 240 ms RTT = 4 min).
+            if ctx.claim_lines:
+                await db.execute(insert(ClaimLine).values([
+                    {
+                        "claim_id": cl.claim_id,
+                        "line_number": cl.line_number,
+                        "procedure_code": cl.procedure_code,
+                        "modifier1": cl.modifier1,
+                        "modifier2": cl.modifier2,
+                        "units": cl.units,
+                        "billed_amount": cl.billed_amount,
+                        "service_date": cl.service_date,
+                        "place_of_service": cl.place_of_service,
+                        "raw_sv1_segment": cl.raw_sv1_segment,
+                    }
+                    for cl in ctx.claim_lines
+                ]))
+            if ctx.diagnoses:
+                await db.execute(insert(Diagnosis).values([
+                    {
+                        "claim_id": d.claim_id,
+                        "diagnosis_code": d.diagnosis_code,
+                        "diagnosis_type": d.diagnosis_type,
+                        "sequence_number": d.sequence_number,
+                        "raw_hi_segment": d.raw_hi_segment,
+                    }
+                    for d in ctx.diagnoses
+                ]))
 
-            # 4. RemittanceClaims → resolve claim_id (3-tier)
+            # 4. RemittanceClaims → resolve claim_id (3-tier); keep ORM here
+            # because the Python instances need their auto-assigned ``id``
+            # back so adjustments + remark_codes can reference them.
             await self._resolve_remittance_claim_ids(ctx, db, local_claim_map)
             db.add_all(ctx.remittance_claims)
             await db.flush()
 
-            # 5. Adjustments + RemarkCodes → resolve remittance_claim_id
+            # 5. Adjustments + RemarkCodes → bulk Core INSERT after resolving
+            #    the remittance_claim_id from the tagged in-memory ref.
             for adj in ctx.adjustments:
                 ref = getattr(adj, "_parse_rc_ref", None)
                 if ref is not None:
@@ -306,17 +346,64 @@ class EdiParser:
                 if ref is not None:
                     remark.remittance_claim_id = ref.id
 
-            db.add_all(ctx.adjustments)
-            db.add_all(ctx.remark_codes)
+            if ctx.adjustments:
+                await db.execute(insert(Adjustment).values([
+                    {
+                        "remittance_claim_id": a.remittance_claim_id,
+                        "adjustment_group_code": a.adjustment_group_code,
+                        "adjustment_reason_code": a.adjustment_reason_code,
+                        "adjustment_amount": a.adjustment_amount,
+                        "quantity": a.quantity,
+                        "raw_cas_segment": a.raw_cas_segment,
+                    }
+                    for a in ctx.adjustments
+                ]))
+            if ctx.remark_codes:
+                await db.execute(insert(RemarkCode).values([
+                    {
+                        "remittance_claim_id": r.remittance_claim_id,
+                        "remark_code": r.remark_code,
+                        "raw_lq_segment": r.raw_lq_segment,
+                    }
+                    for r in ctx.remark_codes
+                ]))
 
-            # 6. RawSegments → set edi_file_id + optional claim_id
-            for raw in ctx.raw_segments:
-                raw.edi_file_id = ctx.edi_file.id
-                claim_ref = getattr(raw, "_parse_claim_ref", None)
-                if claim_ref is not None and claim_ref.id:
-                    raw.claim_id = claim_ref.id
+            # 6. RawSegments — set edi_file_id + optional claim_id, then
+            # bulk Core INSERT. This is the largest table by row count
+            # (~7 segments/claim) so it benefits most from skipping ORM.
+            #
+            # Deployment-time opt-out: ``settings.SKIP_RAW_SEGMENTS_STORAGE``
+            # is True on environments where the table doesn't exist (e.g.
+            # the migrated remote ``rcmdenialpoc``, where ``raw_segments``
+            # was deliberately excluded from the dump per directive). The
+            # ML pipeline + 837 recommendation path don't depend on it;
+            # only the 835 recommendation endpoint joins on it.
+            from app.core.config import settings as _app_settings
+            if _app_settings.SKIP_RAW_SEGMENTS_STORAGE:
+                logger.info(
+                    "Skipping raw_segments insert (SKIP_RAW_SEGMENTS_STORAGE=True). "
+                    "Discarded %d segment(s) from this parse.",
+                    len(ctx.raw_segments),
+                )
+            else:
+                for raw in ctx.raw_segments:
+                    raw.edi_file_id = ctx.edi_file.id
+                    claim_ref = getattr(raw, "_parse_claim_ref", None)
+                    if claim_ref is not None and claim_ref.id:
+                        raw.claim_id = claim_ref.id
 
-            db.add_all(ctx.raw_segments)
+                if ctx.raw_segments:
+                    await db.execute(insert(RawSegment).values([
+                        {
+                            "edi_file_id": rs.edi_file_id,
+                            "claim_id": rs.claim_id,
+                            "segment_name": rs.segment_name,
+                            "segment_position": rs.segment_position,
+                            "raw_segment_text": rs.raw_segment_text,
+                            "parse_error": rs.parse_error,
+                        }
+                        for rs in ctx.raw_segments
+                    ]))
 
             # 7. Update claim statuses from 835 data
             if ctx.file_type == FileType.edi_835:

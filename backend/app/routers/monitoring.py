@@ -49,33 +49,34 @@ async def live_performance(
     model_version: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Precision / recall / accuracy on resolved predictions in window."""
+    """Precision / recall / accuracy on resolved predictions in window.
+
+    Server-side aggregate (was SELECT * → 10k+ rows over WAN → count in
+    Python, taking ~28s; now returns 4 numbers in one row, sub-second
+    even over WAN).
+    """
+    from sqlalchemy import text
+
     since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    stmt = (
-        select(PredictionLog)
-        .where(
-            PredictionLog.resolved_at.is_not(None),
-            PredictionLog.resolved_at >= since,
-        )
-    )
+    params = {"since": since}
+    where_extra = ""
     if model_version:
-        stmt = stmt.where(PredictionLog.model_version == model_version)
+        where_extra = " AND model_version = :model_version"
+        params["model_version"] = model_version
 
-    rows = (await db.execute(stmt)).scalars().all()
-
-    tp = fp = tn = fn = 0
-    for r in rows:
-        actual = int(r.actual_denied)
-        pred = int(r.predicted_label)
-        if pred == 1 and actual == 1:
-            tp += 1
-        elif pred == 1 and actual == 0:
-            fp += 1
-        elif pred == 0 and actual == 0:
-            tn += 1
-        else:
-            fn += 1
+    sql = text(f"""
+        SELECT
+            count(*) FILTER (WHERE predicted_label = 1 AND actual_denied = 1)::bigint AS tp,
+            count(*) FILTER (WHERE predicted_label = 1 AND actual_denied = 0)::bigint AS fp,
+            count(*) FILTER (WHERE predicted_label = 0 AND actual_denied = 0)::bigint AS tn,
+            count(*) FILTER (WHERE predicted_label = 0 AND actual_denied = 1)::bigint AS fn
+        FROM prediction_log
+        WHERE resolved_at IS NOT NULL
+          AND resolved_at >= :since
+          {where_extra}
+    """)
+    row = (await db.execute(sql, params)).one()
+    tp = int(row.tp); fp = int(row.fp); tn = int(row.tn); fn = int(row.fn)
 
     total = tp + fp + tn + fn
     precision = _safe_div(tp, tp + fp)
@@ -244,16 +245,12 @@ async def drift_report(
             ),
         )
 
-    # Build a recent-claims DataFrame using the same loader the trainer uses.
-    # build_dataset() returns labelled claims only; for drift we just need
-    # the raw shape of incoming claims, so we also accept unlabelled rows
-    # by skipping the remittance filter — but reusing build_dataset keeps
-    # column names identical to the snapshot. Cost is acceptable for the
-    # short window typically requested here.
-    df = await build_dataset(db)
-    if not df.empty and "service_from_date" in df.columns:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-        df = df[pd.to_datetime(df["service_from_date"], errors="coerce").dt.date >= cutoff]
+    # Build a recent-claims DataFrame, but server-side filter to the window
+    # so we don't drag the whole 670k-row training set across the WAN just to
+    # discard 99% of it in Python. The cutoff goes to build_dataset which
+    # adds a WHERE service_from_date >= cutoff to the SELECT.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+    df = await build_dataset(db, since_service_date=cutoff)
 
     # Prediction-score drift: from the prediction_log within the window.
     pred_since = datetime.now(timezone.utc) - timedelta(days=days)

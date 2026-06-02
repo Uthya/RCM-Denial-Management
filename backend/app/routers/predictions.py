@@ -375,9 +375,51 @@ async def feature_meta():
 
 @router.get("/dataset-stats")
 async def dataset_stats(db: AsyncSession = Depends(get_db)):
-    """Return label distribution stats for the training dataset."""
-    df = await build_dataset(db)
-    return get_dataset_stats(df)
+    """Return label distribution stats for the training dataset.
+
+    Server-side aggregate (was pulling 670k claims + 2.8M lines +
+    2.5M diagnoses + 670k remits across the WAN to count in pandas;
+    over an 11 Mbps link that took 30+ minutes). The query below
+    replicates the labeling rule from ``_label_from_remittances``
+    exactly:
+      - only originals (frequency_code NULL or '1')
+      - need at least one remit
+      - 'denied' if ANY remit has CLP02='4'; else 'paid' if ANY has
+        CLP02 in (1,2,3,19,20); else excluded (label=None)
+    The whole thing runs in Postgres and returns 4 numbers, sub-second
+    even over WAN.
+    """
+    from sqlalchemy import text
+    sql = text("""
+        WITH labeled AS (
+            SELECT c.id,
+                   CASE
+                       WHEN bool_or(rc.claim_status_code = '4') THEN 1
+                       WHEN bool_or(rc.claim_status_code IN ('1','2','3','19','20')) THEN 0
+                       ELSE NULL
+                   END AS denied
+            FROM claims c
+            JOIN remittance_claims rc ON rc.claim_id = c.id
+            WHERE c.frequency_code IS NULL OR c.frequency_code = '1'
+            GROUP BY c.id
+        )
+        SELECT
+            count(*) FILTER (WHERE denied IS NOT NULL)::bigint AS total,
+            count(*) FILTER (WHERE denied = 1)::bigint AS denied,
+            count(*) FILTER (WHERE denied = 0)::bigint AS paid
+        FROM labeled
+    """)
+    row = (await db.execute(sql)).one()
+    total = int(row.total or 0)
+    denied = int(row.denied or 0)
+    paid = int(row.paid or 0)
+    denial_rate = round(denied / total, 4) if total else 0.0
+    return {
+        "total": total,
+        "denied": denied,
+        "paid": paid,
+        "denial_rate": denial_rate,
+    }
 
 
 @router.post("/train")

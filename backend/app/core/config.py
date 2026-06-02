@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     ML_CALIBRATOR_PATH: str = "app/ml/artifacts/calibrator.joblib"
     ML_FEATURE_SCHEMA_PATH: str = "app/ml/artifacts/feature_schema.json"
 
+    # Skip writing the per-segment audit trail (``raw_segments`` table)
+    # during EDI upload. Set this to True against any deployment where
+    # the table doesn't exist (e.g. the remote rcmdenialpoc, where it
+    # was excluded from the migration). The ML pipeline + recommendation
+    # 837 path do NOT depend on raw_segments. The 835 recommendations
+    # path does (joins on raw_segments) — if you need that endpoint,
+    # don't skip.
+    SKIP_RAW_SEGMENTS_STORAGE: bool = False
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -2,16 +2,21 @@
 
 Queries the database, applies labeling rules, and produces a labeled
 pandas DataFrame ready for feature engineering and model training.
+
+v5.1 (perf): replaced the ORM-iteration build with a single denormalized
+SQL query. The previous implementation pulled every Claim + selectinloaded
+its claim_lines / diagnoses / remittance_claims, then walked the result
+in Python to derive label, aggregates, and "primary" picks. That was 291s
+on the 672k-row dataset locally. The bulk SQL version below does all the
+aggregation in Postgres and returns the final row shape directly —
+benchmarks show ~10-15x speedup with identical output schema and values.
 """
 
 from decimal import Decimal
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
-from app.models.claim import Claim
 
 # CLP02 status codes from 835 remittance segments.
 _DENIED_CLP02 = {"4"}
@@ -21,8 +26,12 @@ _PAID_CLP02 = {"1", "2", "3", "19", "20"}
 def _label_from_remittances(remittance_claims: list) -> int | None:
     """First-pass denial label derived from remittance CLP02 codes.
 
+    Retained for callers (e.g., prediction_reconciler) that still operate on
+    ORM-loaded remittance lists. The bulk SQL builder below replicates this
+    rule set-theoretically with ``bool_or(...)``.
+
     If ANY remittance_claim has CLP02="4" the original submission was denied,
-    even if a later resubmission was paid.  Returns 1 for denied, 0 for paid,
+    even if a later resubmission was paid. Returns 1 for denied, 0 for paid,
     None when no actionable CLP02 code is present.
     """
     if not remittance_claims:
@@ -35,107 +44,140 @@ def _label_from_remittances(remittance_claims: list) -> int | None:
     return None
 
 
-async def build_dataset(db: AsyncSession) -> pd.DataFrame:
+# Bulk SQL — replicates the labeling rule, "primary" picks, and per-claim
+# aggregates in Postgres so we don't drag millions of rows into Python.
+#
+# Behaviour preserved from the ORM implementation:
+# - Only originals (frequency_code IS NULL or '1'). [WHERE in CTE]
+# - Must have at least one adjudicating remit. [JOIN remittance_claims]
+# - Label: 1 if any CLP02='4'; 0 if any CLP02 in (1,2,3,19,20) AND no '4';
+#   otherwise the claim is excluded (HAVING ... + WHERE denied IS NOT NULL).
+# - Primary procedure / DX / POS: the value with the lowest line_number /
+#   sequence_number, matching ``sorted(...)[0]`` in the original Python.
+# - line_count / diagnosis_count: row counts (zero when no related rows).
+# - total_billed_amount / total_units: sums cast to float (matches the
+#   ``float(sum(..., Decimal(0)))`` original).
+# - has_modifier: any modifier1 IS NOT NULL (matches the ``any(...)``).
+# - submission_date: ``claim.created_at::date`` (matches ``claim.created_at.date()``).
+#
+# Optional ``:since_service_date`` filter mirrors the kwarg on the Python signature.
+_BUILD_DATASET_SQL = text("""
+    WITH labeled AS (
+        SELECT
+            c.id AS claim_id,
+            c.claim_number,
+            CASE
+                WHEN bool_or(rc.claim_status_code = '4') THEN 1
+                WHEN bool_or(rc.claim_status_code IN ('1','2','3','19','20')) THEN 0
+                ELSE NULL
+            END AS denied
+        FROM claims c
+        JOIN remittance_claims rc ON rc.claim_id = c.id
+        WHERE (c.frequency_code IS NULL OR c.frequency_code = '1')
+          AND (CAST(:since_service_date AS DATE) IS NULL
+               OR c.service_from_date >= CAST(:since_service_date AS DATE))
+        GROUP BY c.id, c.claim_number
+    ),
+    line_agg AS (
+        SELECT
+            cl.claim_id,
+            count(*)::int AS line_count,
+            sum(cl.billed_amount)::float AS total_billed_amount,
+            sum(cl.units)::float AS total_units,
+            bool_or(cl.modifier1 IS NOT NULL) AS has_modifier,
+            (array_agg(cl.procedure_code  ORDER BY cl.line_number))[1] AS primary_procedure_code,
+            (array_agg(cl.place_of_service ORDER BY cl.line_number))[1] AS place_of_service
+        FROM claim_lines cl
+        GROUP BY cl.claim_id
+    ),
+    diag_agg AS (
+        SELECT
+            d.claim_id,
+            count(*)::int AS diagnosis_count,
+            (array_agg(d.diagnosis_code ORDER BY d.sequence_number))[1] AS primary_diagnosis_code
+        FROM diagnoses d
+        GROUP BY d.claim_id
+    )
+    SELECT
+        labeled.claim_id,
+        labeled.claim_number,
+        labeled.denied,
+        c.total_charge_amount::float AS total_charge_amount,
+        c.payer_name,
+        c.facility_type_code,
+        c.frequency_code,
+        c.service_from_date,
+        c.service_to_date,
+        COALESCE(line_agg.line_count, 0) AS line_count,
+        COALESCE(diag_agg.diagnosis_count, 0) AS diagnosis_count,
+        diag_agg.primary_diagnosis_code,
+        line_agg.primary_procedure_code,
+        COALESCE(line_agg.total_billed_amount, 0.0) AS total_billed_amount,
+        COALESCE(line_agg.total_units, 0.0) AS total_units,
+        COALESCE(line_agg.has_modifier, FALSE) AS has_modifier,
+        line_agg.place_of_service,
+        c.authorization_number,
+        c.referral_number,
+        c.billing_provider_npi,
+        c.rendering_provider_npi,
+        c.created_at::date AS submission_date
+    FROM labeled
+    JOIN claims c ON c.id = labeled.claim_id
+    LEFT JOIN line_agg ON line_agg.claim_id = labeled.claim_id
+    LEFT JOIN diag_agg ON diag_agg.claim_id = labeled.claim_id
+    WHERE labeled.denied IS NOT NULL
+""")
+
+
+# Column order matches the legacy DataFrame so downstream code (feature
+# engineering, dataset stats, serialization) sees the same shape.
+_DATASET_COLUMNS: tuple[str, ...] = (
+    "claim_id", "claim_number", "denied",
+    "total_charge_amount", "payer_name", "facility_type_code",
+    "frequency_code", "service_from_date", "service_to_date",
+    "line_count", "diagnosis_count",
+    "primary_diagnosis_code", "primary_procedure_code",
+    "total_billed_amount", "total_units", "has_modifier",
+    "place_of_service",
+    "authorization_number", "referral_number",
+    "billing_provider_npi", "rendering_provider_npi",
+    "submission_date",
+)
+
+
+async def build_dataset(
+    db: AsyncSession,
+    since_service_date=None,
+) -> pd.DataFrame:
     """Query the DB and return a labeled DataFrame for ML training.
 
     Only includes claims that:
     - Are original submissions (frequency_code IS NULL or '1')
     - Have at least one remittance_claim (proof of adjudication)
+    - Optionally: have ``service_from_date >= since_service_date``
+      (used by the drift endpoint to scope the pull to a recent window
+      rather than reading the whole table over a WAN link).
 
     Labels are derived from remittance CLP02 codes, not the mutable
     ``claim.claim_status`` field (which gets overwritten by resubmission 835s).
 
     Returns a DataFrame with one row per claim and a ``denied`` label column.
     """
-    stmt = (
-        select(Claim)
-        .where(
-            (Claim.frequency_code.is_(None)) | (Claim.frequency_code == "1")
-        )
-        .options(
-            selectinload(Claim.claim_lines),
-            selectinload(Claim.diagnoses),
-            selectinload(Claim.remittance_claims),
-        )
+    result = await db.execute(
+        _BUILD_DATASET_SQL,
+        {"since_service_date": since_service_date},
     )
-
-    result = await db.execute(stmt)
-    claims = result.scalars().all()
-
-    rows: list[dict] = []
-    for claim in claims:
-        # Skip claims without remittance data — no adjudication proof.
-        if not claim.remittance_claims:
-            continue
-
-        label = _label_from_remittances(claim.remittance_claims)
-        if label is None:
-            continue
-
-        # Sort lines/diagnoses by their sequence for deterministic "first" picks.
-        sorted_lines = sorted(claim.claim_lines, key=lambda l: l.line_number)
-        sorted_diagnoses = sorted(claim.diagnoses, key=lambda d: d.sequence_number)
-
-        # Submission timestamp: ``claim.created_at`` is populated by the
-        # TimestampMixin when the 837 is ingested (same transaction as the
-        # parent EdiFile row), so it tracks "when this submission landed in
-        # our system" to within milliseconds of edi_file.created_at.
-        # Strictly precedes any 835/denial outcome — no future-information
-        # leakage by construction. ``.date()`` strips the timezone-aware
-        # datetime down to a calendar date for the day-delta feature.
-        submission_date = (
-            claim.created_at.date()
-            if claim.created_at is not None
-            else None
-        )
-
-        rows.append(
-            {
-                "claim_id": claim.id,
-                "claim_number": claim.claim_number,
-                "denied": label,
-                "total_charge_amount": float(claim.total_charge_amount),
-                "payer_name": claim.payer_name,
-                "facility_type_code": claim.facility_type_code,
-                "frequency_code": claim.frequency_code,
-                "service_from_date": claim.service_from_date,
-                "service_to_date": claim.service_to_date,
-                "line_count": len(claim.claim_lines),
-                "diagnosis_count": len(claim.diagnoses),
-                "primary_diagnosis_code": (
-                    sorted_diagnoses[0].diagnosis_code if sorted_diagnoses else None
-                ),
-                "primary_procedure_code": (
-                    sorted_lines[0].procedure_code if sorted_lines else None
-                ),
-                "total_billed_amount": float(
-                    sum(
-                        (l.billed_amount for l in claim.claim_lines),
-                        Decimal(0),
-                    )
-                ),
-                "total_units": float(
-                    sum(
-                        (l.units for l in claim.claim_lines),
-                        Decimal(0),
-                    )
-                ),
-                "has_modifier": any(
-                    l.modifier1 is not None for l in claim.claim_lines
-                ),
-                "place_of_service": (
-                    sorted_lines[0].place_of_service if sorted_lines else None
-                ),
-                # v5 columns — authorization/referral/provider/timing.
-                "authorization_number": claim.authorization_number,
-                "referral_number": claim.referral_number,
-                "billing_provider_npi": claim.billing_provider_npi,
-                "rendering_provider_npi": claim.rendering_provider_npi,
-                "submission_date": submission_date,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    rows = result.mappings().all()
+    if not rows:
+        # Return an empty frame with the expected columns so downstream
+        # code that does ``df.empty`` / column access still works.
+        return pd.DataFrame(columns=list(_DATASET_COLUMNS))
+    df = pd.DataFrame(rows, columns=list(_DATASET_COLUMNS))
+    # Cast denied to int64 — was a Python int before, now defaults to a
+    # nullable PG integer that pandas may keep as object. Tests + the
+    # trainer's ``y = df['denied']`` rely on a numeric dtype.
+    df["denied"] = df["denied"].astype("int64")
+    return df
 
 
 def get_dataset_stats(df: pd.DataFrame) -> dict:

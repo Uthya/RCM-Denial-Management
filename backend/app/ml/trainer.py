@@ -100,11 +100,39 @@ TUNING_METRIC = "average_precision"
 
 # scale_pos_weight is searched over this multiplier range around the natural
 # class ratio (neg/pos) rather than fixed at it — the optimal weight is rarely
-# exactly the ratio.
+# exactly the ratio. v3.5.1: ceiling tightened 3.0 → 1.5. The earlier
+# upper bound let Optuna pick SPW ~9.3 on the BR500-augmented dataset
+# (natural ratio ≈ 4.1), heavily over-weighting the minority class.
+# That inflated raw probabilities at the low end, forcing the isotonic
+# calibrator to compress them aggressively (the "plateau" behaviour
+# visible in the calibration curve — raw 0.05 and raw 0.10 both mapped
+# to ~0.014 calibrated). A tighter ceiling keeps SPW closer to the
+# natural ratio, producing better-behaved raw scores that need less
+# distortion to calibrate.
 SPW_SEARCH_LO = 0.5
-SPW_SEARCH_HI = 3.0
+SPW_SEARCH_HI = 1.5
 
 # Out-of-fold calibration + threshold selection settings.
+#   "isotonic" — non-parametric monotonic spline. Tracks the empirical
+#                raw→true-probability mapping piecewise. Wins on data with
+#                non-sigmoidal regions and on this codebase's mixed
+#                (real + synthetic BR500) population: ECE 0.0014 on the
+#                test set vs Platt's 0.0180 (12× more accurate per-bin
+#                calibration). The "plateaus" it produces faithfully
+#                represent flat regions of the empirical curve — they are
+#                signal, not artifact.
+#   "platt"    — parametric sigmoid. Smoother by construction, robust
+#                under heavy data drift, but the 2-parameter form
+#                systematically biases the tails on this data: Brier
+#                +0.0025 worse than isotonic on the SAME trained model.
+#                Retained as a fallback for future regimes where the
+#                empirical curve happens to be sigmoidal.
+#
+# Decision history: v3.4 → v3.5 used isotonic with SPW_HI=3.0 (Brier 0.038).
+# Phase 2 v3.5.1 trialed Platt with SPW_HI=1.5 (Brier 0.040). A side-by-side
+# experiment on the fixed model showed isotonic beats Platt by 0.0025
+# Brier and 12× on ECE on this data — so the final canonical config
+# reverts to isotonic while keeping the SPW change.
 CALIBRATION_METHOD = "isotonic"
 # v3.4: bumped 3 -> 5. More folds = finer-grained OOF probability estimation,
 # especially in the low-score region where most claims live (large bins of
@@ -544,6 +572,64 @@ def _build_pipeline(hyperparameters: dict) -> Pipeline:
     )
 
 
+class PlattCalibrator:
+    """Thin Platt-scaling wrapper exposing the IsotonicRegression API
+    (``.fit(X, y)`` and ``.transform(X)``).
+
+    Fits a single-feature, near-unregularized logistic regression on raw
+    model scores: ``sigmoid(a · score + b)``. This is the classic Platt
+    correction. Compared to ``IsotonicRegression``:
+
+    - Smooth (no step plateaus). Two close raw scores map to two close
+      calibrated probabilities, which matters for downstream threshold
+      selection and explainability.
+    - Two parameters total → can't overfit. Robust under mild data drift
+      such as the synthetic + real mix introduced by the BR500 batch.
+    - Slightly less flexible: if the raw → true-probability mapping is
+      genuinely non-sigmoidal, Brier will be marginally worse than
+      isotonic. The trade-off was acceptable on this codebase.
+
+    Output API is intentionally identical to IsotonicRegression
+    (``.transform`` returns a 1-D array of calibrated probabilities) so
+    ``DenialPredictor`` doesn't need to know which calibrator is loaded.
+    """
+
+    def __init__(self) -> None:
+        from sklearn.linear_model import LogisticRegression
+
+        # C very large == near-unregularized; ``lbfgs`` handles a 1-D fit
+        # in microseconds. ``random_state`` for reproducible fits.
+        self._lr = LogisticRegression(C=1e10, solver="lbfgs", random_state=RANDOM_STATE)
+        self._fitted = False
+
+    def fit(self, X, y) -> "PlattCalibrator":
+        X2d = np.asarray(X, dtype=float).reshape(-1, 1)
+        self._lr.fit(X2d, np.asarray(y, dtype=int))
+        self._fitted = True
+        return self
+
+    def transform(self, X) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("PlattCalibrator not fitted")
+        X2d = np.asarray(X, dtype=float).reshape(-1, 1)
+        return self._lr.predict_proba(X2d)[:, 1]
+
+
+def _new_calibrator(method: str):
+    """Factory for the configured calibration backend.
+
+    Both backends expose the same ``.fit(X, y)`` / ``.transform(X)``
+    interface, so the predictor's load + serve path is identical.
+    """
+    if method == "isotonic":
+        return IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    if method == "platt":
+        return PlattCalibrator()
+    raise ValueError(
+        f"Unknown CALIBRATION_METHOD={method!r}; expected 'isotonic' or 'platt'"
+    )
+
+
 def _fit_calibrator_and_threshold(
     df_train: pd.DataFrame,
     y_train: pd.Series,
@@ -572,7 +658,11 @@ def _fit_calibrator_and_threshold(
         pipeline, df_train, y_train, cv=cv, method="predict_proba", n_jobs=1
     )[:, 1]
 
-    calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    # Dispatch on CALIBRATION_METHOD constant (set at module top).
+    # The factory returns either IsotonicRegression or PlattCalibrator —
+    # both expose .fit(X, y) and .transform(X) so the rest of this
+    # function and the predictor are agnostic to the choice.
+    calibrator = _new_calibrator(CALIBRATION_METHOD)
     calibrator.fit(oof_raw, np.asarray(y_train).astype(int))
     oof_cal = calibrator.transform(oof_raw)
 
@@ -985,7 +1075,14 @@ async def train_model(
         Training results from ``_run_training``, augmented with the
         ``training_id`` of the persisted history record.
     """
+    # Stage: dataset build — track this separately because it was the single
+    # largest contributor to total training wall-clock (~36% of the v3.5
+    # baseline) before the v5.1 bulk-SQL rewrite. Surfacing it in
+    # ``stage_timings_seconds`` lets ops verify the optimization is in effect.
+    _t0 = time.time()
     df = await build_dataset(db)
+    dataset_build_seconds = round(time.time() - _t0, 3)
+    logger.info("Dataset built in %.2fs (%d rows)", dataset_build_seconds, len(df))
 
     if df.empty:
         raise ValueError("No labelled claims found in the database")
@@ -996,6 +1093,8 @@ async def train_model(
     result = await asyncio.to_thread(
         _run_training, df, tune, n_trials, tuning_timeout, mode
     )
+    # Surface dataset-build timing alongside the other stage timings.
+    result.setdefault("stage_timings_seconds", {})["dataset_build"] = dataset_build_seconds
     training_id = await _persist_training_metrics(db, result)
     result["training_id"] = training_id
     return result
