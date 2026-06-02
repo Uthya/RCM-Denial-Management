@@ -371,39 +371,24 @@ class EdiParser:
             # 6. RawSegments — set edi_file_id + optional claim_id, then
             # bulk Core INSERT. This is the largest table by row count
             # (~7 segments/claim) so it benefits most from skipping ORM.
-            #
-            # Deployment-time opt-out: ``settings.SKIP_RAW_SEGMENTS_STORAGE``
-            # is True on environments where the table doesn't exist (e.g.
-            # the migrated remote ``rcmdenialpoc``, where ``raw_segments``
-            # was deliberately excluded from the dump per directive). The
-            # ML pipeline + 837 recommendation path don't depend on it;
-            # only the 835 recommendation endpoint joins on it.
-            from app.core.config import settings as _app_settings
-            if _app_settings.SKIP_RAW_SEGMENTS_STORAGE:
-                logger.info(
-                    "Skipping raw_segments insert (SKIP_RAW_SEGMENTS_STORAGE=True). "
-                    "Discarded %d segment(s) from this parse.",
-                    len(ctx.raw_segments),
-                )
-            else:
-                for raw in ctx.raw_segments:
-                    raw.edi_file_id = ctx.edi_file.id
-                    claim_ref = getattr(raw, "_parse_claim_ref", None)
-                    if claim_ref is not None and claim_ref.id:
-                        raw.claim_id = claim_ref.id
+            for raw in ctx.raw_segments:
+                raw.edi_file_id = ctx.edi_file.id
+                claim_ref = getattr(raw, "_parse_claim_ref", None)
+                if claim_ref is not None and claim_ref.id:
+                    raw.claim_id = claim_ref.id
 
-                if ctx.raw_segments:
-                    await db.execute(insert(RawSegment).values([
-                        {
-                            "edi_file_id": rs.edi_file_id,
-                            "claim_id": rs.claim_id,
-                            "segment_name": rs.segment_name,
-                            "segment_position": rs.segment_position,
-                            "raw_segment_text": rs.raw_segment_text,
-                            "parse_error": rs.parse_error,
-                        }
-                        for rs in ctx.raw_segments
-                    ]))
+            if ctx.raw_segments:
+                await db.execute(insert(RawSegment).values([
+                    {
+                        "edi_file_id": rs.edi_file_id,
+                        "claim_id": rs.claim_id,
+                        "segment_name": rs.segment_name,
+                        "segment_position": rs.segment_position,
+                        "raw_segment_text": rs.raw_segment_text,
+                        "parse_error": rs.parse_error,
+                    }
+                    for rs in ctx.raw_segments
+                ]))
 
             # 7. Update claim statuses from 835 data
             if ctx.file_type == FileType.edi_835:

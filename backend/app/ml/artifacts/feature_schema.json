@@ -54,9 +54,9 @@
     "primary_diagnosis_code",
     "place_of_service"
   ],
-  "training_prevalence": 0.196599,
-  "training_size": 672403,
+  "training_prevalence": 0.199515,
+  "training_size": 679102,
   "calibration_method": "isotonic",
-  "decision_threshold": 0.149444,
-  "trained_at": "2026-06-02T09:25:33.386711+00:00"
+  "decision_threshold": 0.194444,
+  "trained_at": "2026-06-02T12:13:56.899239+00:00"
 }
