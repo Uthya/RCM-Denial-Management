@@ -34,3 +34,5 @@ backend/app/ml/artifacts/*.bin
 # Virtual environments
 venv/
 .venv/
+
+.claude/settings.local.json

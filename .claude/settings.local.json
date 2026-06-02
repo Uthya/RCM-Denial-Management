@@ -4,7 +4,21 @@
       "Bash(alembic revision:*)",
       "Bash(alembic heads:*)",
       "Bash(cmd.exe:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Gowdham B\\\\Documents\\\\RCM Denial Management\\\\RCM-Denial-Management\\\\backend\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \"LISTENING\")",
+      "Bash(findstr \":8000 :5173 :5174\")",
+      "Bash(uvicorn app.main:app --reload --host 0.0.0.0 --port 8000)",
+      "Bash(npm run *)",
+      "Bash(pip list *)",
+      "Bash(findstr /I \"pydantic scikit-learn xgboost pandas numpy fastapi sqlalchemy asyncpg alembic\")",
+      "Bash('/c/Program Files/PostgreSQL/16/bin/pg_dump.exe' --version)",
+      "Bash('/c/Program Files/PostgreSQL/16/bin/pg_restore.exe' --version)",
+      "Bash(tee -a /c/tmp/rcm_migration/migration.log)",
+      "Bash(mkdir -p /c/tmp/rcm_migration)",
+      "Bash(PGPASSWORD=postgres '/c/Program Files/PostgreSQL/16/bin/pg_dump.exe' -h localhost -p 5432 -U postgres -d rcm_denials -Fc --no-owner --no-privileges --table=public.raw_segments -f /c/tmp/rcm_migration/raw_segments.dump)"
     ]
   }
 }
